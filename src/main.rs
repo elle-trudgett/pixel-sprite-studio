@@ -935,7 +935,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
 /// Character editor with parts, states, and circular rotation wheel
 fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_name: &str) {
     // Don't process interactions if a dialog is open
-    if state.show_new_part_dialog || state.show_new_state_dialog || state.show_import_rotation_dialog {
+    if state.show_new_part_dialog || state.show_new_state_dialog {
         ui.set_enabled(false);
     }
 
@@ -973,83 +973,96 @@ fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_name: &
         (parts, selected_part_states, selected_state_rotations)
     };
 
-    // Three-column layout
+    // Three-column layout: 20% / 20% / 60%
+    let available_width = ui.available_width();
+    let available_height = ui.available_height();
+
     ui.horizontal(|ui| {
-        // Parts column
-        ui.vertical(|ui| {
-            ui.set_min_width(120.0);
-            ui.heading("Parts");
-            ui.separator();
+        // Parts column (20%)
+        ui.allocate_ui_with_layout(
+            egui::vec2(available_width * 0.2, available_height),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.heading("Parts");
+                ui.separator();
 
-            if parts.is_empty() {
-                ui.label("(No parts)");
-            }
-            for part_name in &parts {
-                let is_selected = state.editor_selected_part.as_ref() == Some(part_name);
-                if ui.selectable_label(is_selected, part_name).clicked() {
-                    state.editor_selected_part = Some(part_name.clone());
-                    state.editor_selected_state = None;
+                if parts.is_empty() {
+                    ui.label("(No parts)");
                 }
-            }
-
-            ui.separator();
-            if ui.button("+ Add Part").clicked() {
-                state.show_new_part_dialog = true;
-                state.new_part_name.clear();
-            }
-        });
-
-        ui.separator();
-
-        // States column
-        ui.vertical(|ui| {
-            ui.set_min_width(120.0);
-            ui.heading("States");
-            ui.separator();
-
-            if let Some(ref part_name) = state.editor_selected_part.clone() {
-                if selected_part_states.is_empty() {
-                    ui.label("(No states)");
-                }
-                for (state_name, has_images) in &selected_part_states {
-                    let is_selected = state.editor_selected_state.as_ref() == Some(state_name)
-                        || (state.editor_selected_state.is_none()
-                            && selected_part_states.first().map(|(n, _)| n) == Some(state_name));
-
-                    let label = if *has_images {
-                        egui::RichText::new(state_name).strong()
-                    } else {
-                        egui::RichText::new(state_name)
-                    };
-
-                    if ui.selectable_label(is_selected, label).clicked() {
-                        state.editor_selected_state = Some(state_name.clone());
+                for part_name in &parts {
+                    let is_selected = state.editor_selected_part.as_ref() == Some(part_name);
+                    if ui.selectable_label(is_selected, part_name).clicked() {
+                        state.editor_selected_part = Some(part_name.clone());
+                        state.editor_selected_state = None;
                     }
                 }
 
                 ui.separator();
-                if ui.button("+ Add State").clicked() {
-                    state.show_new_state_dialog = true;
-                    state.new_state_name.clear();
+                if ui.button("+ Add Part").clicked() {
+                    state.show_new_part_dialog = true;
+                    state.new_part_name.clear();
                 }
-            } else {
-                ui.label("Select a part");
-            }
-        });
+            },
+        );
 
         ui.separator();
 
-        // Rotation wheel column
-        ui.vertical(|ui| {
-            ui.heading("Rotations");
-            ui.separator();
+        // States column (20%)
+        ui.allocate_ui_with_layout(
+            egui::vec2(available_width * 0.2, available_height),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.heading("States");
+                ui.separator();
 
-            if state.editor_selected_part.is_some() {
-                render_rotation_wheel(ui, state, char_name, &selected_state_rotations);
-            } else {
-                ui.label("Select a part and state");
-            }
-        });
+                if state.editor_selected_part.is_some() {
+                    if selected_part_states.is_empty() {
+                        ui.label("(No states)");
+                    }
+                    for (state_name, has_images) in &selected_part_states {
+                        let is_selected = state.editor_selected_state.as_ref() == Some(state_name)
+                            || (state.editor_selected_state.is_none()
+                                && selected_part_states.first().map(|(n, _)| n) == Some(state_name));
+
+                        let label = if *has_images {
+                            egui::RichText::new(state_name).strong()
+                        } else {
+                            egui::RichText::new(state_name)
+                        };
+
+                        if ui.selectable_label(is_selected, label).clicked() {
+                            state.editor_selected_state = Some(state_name.clone());
+                        }
+                    }
+
+                    ui.separator();
+                    if ui.button("+ Add State").clicked() {
+                        state.show_new_state_dialog = true;
+                        state.new_state_name.clear();
+                    }
+                } else {
+                    ui.label("Select a part");
+                }
+            },
+        );
+
+        ui.separator();
+
+        // Rotation wheel column (60%)
+        ui.allocate_ui_with_layout(
+            egui::vec2(available_width * 0.58, available_height),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.heading("Rotations");
+                ui.separator();
+
+                if state.editor_selected_part.is_some() {
+                    render_rotation_wheel(ui, state, char_name, &selected_state_rotations);
+                } else {
+                    ui.label("Select a part and state");
+                }
+            },
+        );
     });
 }
 
@@ -1087,10 +1100,11 @@ fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, _char_name: &s
 
     // Draw slots in a circle
     for angle in &angles {
-        // Convert angle to radians - 0° = right (east), going clockwise
-        // In screen coordinates, Y increases downward, so we negate the sin
+        // Convert angle to radians - 0° = East (right), counterclockwise
+        // 0° = E, 90° = N, 180° = W, 270° = S
+        // In screen coordinates, Y increases downward, so negate sin
         let rad = (*angle as f32).to_radians();
-        let slot_center = center + egui::vec2(rad.cos() * radius, rad.sin() * radius);
+        let slot_center = center + egui::vec2(rad.cos() * radius, -rad.sin() * radius);
 
         // Slot rectangle
         let slot_rect = egui::Rect::from_center_size(
@@ -1122,9 +1136,8 @@ fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, _char_name: &s
         // Check for click on this slot
         let slot_response = ui.interact(slot_rect, ui.id().with(("rot_slot", *angle)), egui::Sense::click());
         if slot_response.clicked() {
-            // Import image for this rotation
+            // Store angle for pending import (file picker will be called after render)
             state.pending_rotation_import = Some(*angle);
-            state.show_import_rotation_dialog = true;
         }
 
         if slot_response.hovered() {
@@ -1143,17 +1156,18 @@ fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, _char_name: &s
         egui::Color32::WHITE,
     );
 
-    // Draw compass labels
+    // Draw compass labels (0° = East, counterclockwise)
     let compass_radius = radius + slot_size / 2.0 + 25.0;
     let compass_labels = [
         (0.0_f32, "E (0°)"),
-        (90.0_f32, "S (90°)"),
+        (90.0_f32, "N (90°)"),
         (180.0_f32, "W (180°)"),
-        (270.0_f32, "N (270°)"),
+        (270.0_f32, "S (270°)"),
     ];
     for (deg, label) in compass_labels {
         let rad = deg.to_radians();
-        let pos = center + egui::vec2(rad.cos() * compass_radius, rad.sin() * compass_radius);
+        // Same formula: x = cos, y = -sin for counterclockwise from East
+        let pos = center + egui::vec2(rad.cos() * compass_radius, -rad.sin() * compass_radius);
         painter.text(
             pos,
             egui::Align2::CENTER_CENTER,
@@ -1386,8 +1400,14 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Handle panning with middle mouse or space+drag
-    if is_panning && response.dragged() {
+    // Handle panning - space uses pointer movement, middle mouse uses drag
+    if space_held {
+        // Space: pan by just moving the mouse (no click needed)
+        let delta = ui.input(|i| i.pointer.delta());
+        state.canvas_offset.0 += delta.x;
+        state.canvas_offset.1 += delta.y;
+    } else if middle_mouse_held && response.dragged() {
+        // Middle mouse: pan while dragging
         let delta = response.drag_delta();
         state.canvas_offset.0 += delta.x;
         state.canvas_offset.1 += delta.y;
@@ -1773,67 +1793,39 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
             });
     }
 
-    // Import Rotation dialog (for character editor rotation wheel)
-    if state.show_import_rotation_dialog {
-        egui::Window::new("Import Rotation Image")
-            .collapsible(false)
-            .resizable(false)
-            .min_width(400.0)
-            .show(ctx, |ui| {
-                if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
-                    let part_name = state.editor_selected_part.as_deref().unwrap_or("?");
-                    let state_name = state.editor_selected_state.as_deref().unwrap_or("default");
-                    let angle = state.pending_rotation_import.unwrap_or(0);
-                    ui.label(format!("Importing to: {} / {} / {} @ {}°",
-                        char_name, part_name, state_name, angle));
-                }
-                ui.separator();
+    // Handle pending rotation import with file picker
+    if let Some(angle) = state.pending_rotation_import {
+        if let Some(path) = pick_image_file() {
+            if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                let part_name = state.editor_selected_part.clone();
+                let state_name = state.editor_selected_state.clone()
+                    .or_else(|| Some("default".to_string()));
 
-                ui.label("Enter path to PNG image:");
-                ui.text_edit_singleline(&mut state.import_image_path);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Import").clicked() && !state.import_image_path.is_empty() {
-                        let path = state.import_image_path.clone();
-                        if let Some(angle) = state.pending_rotation_import {
-                            if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
-                                let part_name = state.editor_selected_part.clone();
-                                let state_name = state.editor_selected_state.clone()
-                                    .or_else(|| Some("default".to_string()));
-
-                                match import_image_as_base64(&path) {
-                                    Ok(base64_data) => {
-                                        if let (Some(ref pn), Some(ref sn)) = (part_name, state_name) {
-                                            if let Some(ref mut project) = state.project {
-                                                if let Some(character) = project.get_character_mut(&char_name) {
-                                                    if let Some(part) = character.get_part_mut(pn) {
-                                                        if let Some(state_obj) = part.states.iter_mut().find(|s| &s.name == sn) {
-                                                            if let Some(rotation) = state_obj.rotations.get_mut(&angle) {
-                                                                rotation.image_data = Some(base64_data);
-                                                                state.set_status(format!("Imported image for {}°", angle));
-                                                                state.texture_cache.clear();
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                match import_image_as_base64(path.to_str().unwrap_or("")) {
+                    Ok(base64_data) => {
+                        if let (Some(ref pn), Some(ref sn)) = (part_name, state_name) {
+                            if let Some(ref mut project) = state.project {
+                                if let Some(character) = project.get_character_mut(&char_name) {
+                                    if let Some(part) = character.get_part_mut(pn) {
+                                        if let Some(state_obj) = part.states.iter_mut().find(|s| &s.name == sn) {
+                                            if let Some(rotation) = state_obj.rotations.get_mut(&angle) {
+                                                rotation.image_data = Some(base64_data);
+                                                state.set_status(format!("Imported image for {}°", angle));
+                                                state.texture_cache.clear();
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        state.set_status(format!("Import failed: {}", e));
                                     }
                                 }
                             }
                         }
-                        state.show_import_rotation_dialog = false;
-                        state.pending_rotation_import = None;
                     }
-                    if ui.button("Cancel").clicked() {
-                        state.show_import_rotation_dialog = false;
-                        state.pending_rotation_import = None;
+                    Err(e) => {
+                        state.set_status(format!("Import failed: {}", e));
                     }
-                });
-            });
+                }
+            }
+        }
+        state.pending_rotation_import = None;
     }
 }
 
