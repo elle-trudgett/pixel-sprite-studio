@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::fs;
 use std::collections::HashMap;
 
+#[cfg(target_os = "windows")]
+use rfd::FileDialog;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -37,10 +40,12 @@ struct AppState {
     current_frame: usize,
     is_playing: bool,
     selected_part_id: Option<u64>,
+    pixel_aligned: bool,
 
     // Dragging state
     dragging_part: Option<DraggedPart>,
     drag_offset: (f32, f32),
+    drag_accumulator: (f32, f32), // Accumulates true position during pixel-aligned drag
 
     // Dialogs
     show_new_character_dialog: bool,
@@ -58,6 +63,8 @@ struct AppState {
     new_animation_name: String,
     selected_character_for_part: Option<String>,
     selected_part_for_state: Option<String>,
+    selected_state_for_import: Option<String>,
+    selected_rotation_for_import: u16,
     file_path_input: String,
     import_image_path: String,
 
@@ -86,8 +93,10 @@ impl AppState {
             current_frame: 0,
             is_playing: false,
             selected_part_id: None,
+            pixel_aligned: true,
             dragging_part: None,
             drag_offset: (0.0, 0.0),
+            drag_accumulator: (0.0, 0.0),
             show_new_character_dialog: false,
             show_new_part_dialog: false,
             show_new_state_dialog: false,
@@ -101,6 +110,8 @@ impl AppState {
             new_animation_name: String::new(),
             selected_character_for_part: None,
             selected_part_for_state: None,
+            selected_state_for_import: None,
+            selected_rotation_for_import: 0,
             file_path_input: String::new(),
             import_image_path: String::new(),
             status_message: None,
@@ -206,6 +217,38 @@ impl AppState {
     }
 }
 
+// Native file dialog functions (Windows only)
+#[cfg(target_os = "windows")]
+fn pick_save_file() -> Option<PathBuf> {
+    FileDialog::new()
+        .add_filter("Sprite Animator Project", &["sprite-animator.json", "json"])
+        .set_file_name("project.sprite-animator.json")
+        .save_file()
+}
+
+#[cfg(target_os = "windows")]
+fn pick_open_file() -> Option<PathBuf> {
+    FileDialog::new()
+        .add_filter("Sprite Animator Project", &["sprite-animator.json", "json"])
+        .pick_file()
+}
+
+#[cfg(target_os = "windows")]
+fn pick_image_file() -> Option<PathBuf> {
+    FileDialog::new()
+        .add_filter("PNG Images", &["png"])
+        .add_filter("All Images", &["png", "jpg", "jpeg", "gif", "bmp"])
+        .pick_file()
+}
+
+// Fallback for non-Windows (returns None, uses text input instead)
+#[cfg(not(target_os = "windows"))]
+fn pick_save_file() -> Option<PathBuf> { None }
+#[cfg(not(target_os = "windows"))]
+fn pick_open_file() -> Option<PathBuf> { None }
+#[cfg(not(target_os = "windows"))]
+fn pick_image_file() -> Option<PathBuf> { None }
+
 fn setup(mut commands: Commands, mut state: ResMut<AppState>) {
     commands.spawn(Camera2d);
     *state = AppState::new();
@@ -227,8 +270,18 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                     ui.close_menu();
                 }
                 if ui.button("Open...").clicked() {
-                    state.show_load_dialog = true;
-                    state.file_path_input.clear();
+                    // Try native file dialog first
+                    if let Some(path) = pick_open_file() {
+                        let path_str = path.to_string_lossy().to_string();
+                        match state.load_project(&path_str) {
+                            Ok(()) => state.set_status(format!("Loaded {}", path_str)),
+                            Err(e) => state.set_status(format!("Load failed: {}", e)),
+                        }
+                    } else {
+                        // Fallback to text input dialog
+                        state.show_load_dialog = true;
+                        state.file_path_input.clear();
+                    }
                     ui.close_menu();
                 }
                 ui.separator();
@@ -244,12 +297,21 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                     ui.close_menu();
                 }
                 if ui.add_enabled(has_project, egui::Button::new("Save As...")).clicked() {
-                    state.show_save_dialog = true;
-                    // Pre-fill with current path or default
-                    state.file_path_input = state.project_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "project.sprite-animator.json".to_string());
+                    // Try native file dialog first
+                    if let Some(path) = pick_save_file() {
+                        let path_str = path.to_string_lossy().to_string();
+                        match state.save_project_as(&path_str) {
+                            Ok(()) => state.set_status(format!("Saved to {}", path_str)),
+                            Err(e) => state.set_status(format!("Save failed: {}", e)),
+                        }
+                    } else {
+                        // Fallback to text input dialog
+                        state.show_save_dialog = true;
+                        state.file_path_input = state.project_path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "project.sprite-animator.json".to_string());
+                    }
                     ui.close_menu();
                 }
                 ui.separator();
@@ -398,13 +460,57 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                                             .default_open(false)
                                             .show(ui, |ui| {
                                                 for state_item in &part.states {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(format!("      {}", &state_item.name));
-                                                        let has_images = state_item.has_images();
-                                                        if has_images {
-                                                            ui.label("✓");
-                                                        }
-                                                    });
+                                                    let state_name = state_item.name.clone();
+                                                    let has_images = state_item.has_images();
+                                                    egui::CollapsingHeader::new(format!("      {} {}", &state_item.name, if has_images { "✓" } else { "" }))
+                                                        .id_salt(format!("{}-{}-{}-rotations", char_name, part_name, state_name))
+                                                        .default_open(false)
+                                                        .show(ui, |ui| {
+                                                            // Show all rotation angles
+                                                            for angle in state_item.rotation_mode.angles() {
+                                                                let has_image = state_item.rotations.get(&angle)
+                                                                    .map(|r| r.image_data.is_some())
+                                                                    .unwrap_or(false);
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label(format!("        {}°", angle));
+                                                                    if has_image {
+                                                                        ui.label("✓");
+                                                                    }
+                                                                    if ui.small_button("Import").clicked() {
+                                                                        // Try native file dialog first
+                                                                        if let Some(path) = pick_image_file() {
+                                                                            let path_str = path.to_string_lossy().to_string();
+                                                                            match import_image_as_base64(&path_str) {
+                                                                                Ok(base64_data) => {
+                                                                                    if let Some(ref mut project) = state.project {
+                                                                                        if let Some(character) = project.get_character_mut(&char_name) {
+                                                                                            if let Some(part) = character.get_part_mut(&part_name) {
+                                                                                                if let Some(state_obj) = part.states.iter_mut().find(|s| s.name == state_name) {
+                                                                                                    if let Some(rotation) = state_obj.rotations.get_mut(&angle) {
+                                                                                                        rotation.image_data = Some(base64_data);
+                                                                                                        state.set_status(format!("Imported image for {}°", angle));
+                                                                                                        state.texture_cache.clear();
+                                                                                                    }
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                Err(e) => state.set_status(format!("Import failed: {}", e)),
+                                                                            }
+                                                                        } else {
+                                                                            // Fallback to text input dialog
+                                                                            state.show_import_image_dialog = true;
+                                                                            state.import_image_path.clear();
+                                                                            state.selected_character_for_part = Some(char_name.clone());
+                                                                            state.selected_part_for_state = Some(part_name.clone());
+                                                                            state.selected_state_for_import = Some(state_name.clone());
+                                                                            state.selected_rotation_for_import = angle;
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
+                                                        });
                                                 }
                                                 if ui.small_button("+ State").clicked() {
                                                     state.show_new_state_dialog = true;
@@ -467,28 +573,63 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
 
             // Show selected part properties
             let selected_info = state.get_selected_placed_part().map(|p| {
-                (p.part_name.clone(), p.position, p.rotation, p.z_override)
+                (p.character_name.clone(), p.part_name.clone(), p.state_name.clone(), p.position, p.rotation, p.z_override)
             });
 
-            if let Some((part_name, position, rotation, z_override)) = selected_info {
+            // Get available states for the selected part
+            let available_states: Vec<String> = if let Some((ref char_name, ref part_name, _, _, _, _)) = selected_info {
+                state.project.as_ref()
+                    .and_then(|p| p.get_character(char_name))
+                    .and_then(|c| c.get_part(part_name))
+                    .map(|p| p.states.iter().map(|s| s.name.clone()).collect())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+
+            if let Some((character_name, part_name, current_state, position, rotation, z_override)) = selected_info {
                 ui.label(format!("Selected: {}", part_name));
+                ui.label(format!("Character: {}", character_name));
                 ui.separator();
 
+                // State selector
+                let mut selected_state = current_state.clone();
+                ui.horizontal(|ui| {
+                    ui.label("State:");
+                    egui::ComboBox::from_id_salt("part_state")
+                        .selected_text(&selected_state)
+                        .show_ui(ui, |ui| {
+                            for state_name in &available_states {
+                                if ui.selectable_value(&mut selected_state, state_name.clone(), state_name).changed() {
+                                    if let Some(part) = state.get_selected_placed_part_mut() {
+                                        part.state_name = selected_state.clone();
+                                        // Clear texture cache to reload with new state
+                                        state.texture_cache.clear();
+                                    }
+                                }
+                            }
+                        });
+                });
+
                 // Position
-                ui.label("Position:");
+                ui.horizontal(|ui| {
+                    ui.label("Position:");
+                    ui.checkbox(&mut state.pixel_aligned, "Pixel aligned");
+                });
                 let mut pos_x = position.0;
                 let mut pos_y = position.1;
+                let pixel_aligned = state.pixel_aligned;
                 ui.horizontal(|ui| {
                     ui.label("  X:");
                     if ui.add(egui::DragValue::new(&mut pos_x).speed(1.0)).changed() {
                         if let Some(part) = state.get_selected_placed_part_mut() {
-                            part.position.0 = pos_x;
+                            part.position.0 = if pixel_aligned { pos_x.round() } else { pos_x };
                         }
                     }
                     ui.label("  Y:");
                     if ui.add(egui::DragValue::new(&mut pos_y).speed(1.0)).changed() {
                         if let Some(part) = state.get_selected_placed_part_mut() {
-                            part.position.1 = pos_y;
+                            part.position.1 = if pixel_aligned { pos_y.round() } else { pos_y };
                         }
                     }
                 });
@@ -679,16 +820,44 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
     });
 }
 
+// Info needed for rendering a placed part
+struct PlacedPartRenderInfo {
+    id: u64,
+    part_name: String,
+    character_name: String,
+    state_name: String,
+    rotation: u16,
+    position: (f32, f32),
+    image_data: Option<String>,
+}
+
 fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     // Capture values from project upfront to avoid borrow conflicts
     let (canvas_size, placed_parts) = {
         let Some(ref project) = state.project else { return };
 
-        let parts: Vec<(u64, String, (f32, f32))> =
+        let parts: Vec<PlacedPartRenderInfo> =
             if let Some(anim) = project.animations.get(state.current_animation) {
                 if let Some(frame) = anim.frames.get(state.current_frame) {
                     frame.placed_parts.iter()
-                        .map(|p| (p.id, p.part_name.clone(), p.position))
+                        .map(|p| {
+                            // Look up image data for this part
+                            let image_data = project.get_character(&p.character_name)
+                                .and_then(|c| c.get_part(&p.part_name))
+                                .and_then(|part| part.states.iter().find(|s| s.name == p.state_name))
+                                .and_then(|s| s.rotations.get(&p.rotation))
+                                .and_then(|r| r.image_data.clone());
+
+                            PlacedPartRenderInfo {
+                                id: p.id,
+                                part_name: p.part_name.clone(),
+                                character_name: p.character_name.clone(),
+                                state_name: p.state_name.clone(),
+                                rotation: p.rotation,
+                                position: p.position,
+                                image_data,
+                            }
+                        })
                         .collect()
                 } else {
                     vec![]
@@ -741,43 +910,90 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Draw placed parts as colored rectangles
-    let part_size = 16.0 * state.zoom_level; // Default 16x16 sprite size
-    for (id, name, (px, py)) in &placed_parts {
-        let screen_x = canvas_rect.min.x + px * state.zoom_level;
-        let screen_y = canvas_rect.min.y + py * state.zoom_level;
+    // Draw placed parts
+    for part_info in &placed_parts {
+        let screen_x = canvas_rect.min.x + part_info.position.0 * state.zoom_level;
+        let screen_y = canvas_rect.min.y + part_info.position.1 * state.zoom_level;
 
-        let part_rect = egui::Rect::from_min_size(
-            egui::pos2(screen_x, screen_y),
-            egui::vec2(part_size, part_size),
-        );
+        let is_selected = state.selected_part_id == Some(part_info.id);
 
-        // Color based on part name hash for variety
-        let hash = name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-        let r = ((hash * 17) % 200 + 55) as u8;
-        let g = ((hash * 31) % 200 + 55) as u8;
-        let b = ((hash * 47) % 200 + 55) as u8;
+        // Try to get or create texture for this part
+        let texture_key = format!("{}/{}/{}/{}",
+            part_info.character_name, part_info.part_name, part_info.state_name, part_info.rotation);
 
-        let is_selected = state.selected_part_id == Some(*id);
-        let fill_color = egui::Color32::from_rgba_unmultiplied(r, g, b, 180);
-        let stroke_color = if is_selected {
-            egui::Color32::YELLOW
-        } else {
-            egui::Color32::WHITE
-        };
-        let stroke_width = if is_selected { 3.0 } else { 1.0 };
+        let mut rendered_texture = false;
+        let mut image_size = (16.0_f32, 16.0_f32);
 
-        painter.rect_filled(part_rect, 2.0, fill_color);
-        painter.rect_stroke(part_rect, 2.0, egui::Stroke::new(stroke_width, stroke_color));
+        if let Some(ref base64_data) = part_info.image_data {
+            // Check if texture is already cached
+            if !state.texture_cache.contains_key(&texture_key) {
+                // Decode and create texture
+                if let Ok(texture) = decode_base64_to_texture(ui.ctx(), &texture_key, base64_data) {
+                    state.texture_cache.insert(texture_key.clone(), texture);
+                }
+            }
 
-        // Draw part name
-        painter.text(
-            part_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            name,
-            egui::FontId::proportional(10.0),
-            egui::Color32::WHITE,
-        );
+            if let Some(texture) = state.texture_cache.get(&texture_key) {
+                let tex_size = texture.size_vec2();
+                image_size = (tex_size.x, tex_size.y);
+                let scaled_size = egui::vec2(tex_size.x * state.zoom_level, tex_size.y * state.zoom_level);
+                let part_rect = egui::Rect::from_min_size(
+                    egui::pos2(screen_x, screen_y),
+                    scaled_size,
+                );
+
+                // Draw the texture
+                painter.image(
+                    texture.id(),
+                    part_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+
+                // Draw selection border
+                if is_selected {
+                    painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+                }
+
+                rendered_texture = true;
+            }
+        }
+
+        // Fallback: draw colored rectangle if no texture
+        if !rendered_texture {
+            let part_size_x = image_size.0 * state.zoom_level;
+            let part_size_y = image_size.1 * state.zoom_level;
+            let part_rect = egui::Rect::from_min_size(
+                egui::pos2(screen_x, screen_y),
+                egui::vec2(part_size_x, part_size_y),
+            );
+
+            // Color based on part name hash for variety
+            let hash = part_info.part_name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+            let r = ((hash * 17) % 200 + 55) as u8;
+            let g = ((hash * 31) % 200 + 55) as u8;
+            let b = ((hash * 47) % 200 + 55) as u8;
+
+            let fill_color = egui::Color32::from_rgba_unmultiplied(r, g, b, 180);
+            let stroke_color = if is_selected {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::WHITE
+            };
+            let stroke_width = if is_selected { 3.0 } else { 1.0 };
+
+            painter.rect_filled(part_rect, 2.0, fill_color);
+            painter.rect_stroke(part_rect, 2.0, egui::Stroke::new(stroke_width, stroke_color));
+
+            // Draw part name
+            painter.text(
+                part_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &part_info.part_name,
+                egui::FontId::proportional(10.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
 
     // Handle mouse interactions
@@ -785,15 +1001,24 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some(pos) = response.interact_pointer_pos() {
             // Check if we clicked on a part
             let mut clicked_part = None;
-            for (id, _, (px, py)) in placed_parts.iter().rev() { // Reverse for top-to-bottom
-                let screen_x = canvas_rect.min.x + px * state.zoom_level;
-                let screen_y = canvas_rect.min.y + py * state.zoom_level;
+            for part_info in placed_parts.iter().rev() { // Reverse for top-to-bottom
+                let screen_x = canvas_rect.min.x + part_info.position.0 * state.zoom_level;
+                let screen_y = canvas_rect.min.y + part_info.position.1 * state.zoom_level;
+                // Use cached texture size if available, otherwise default 16x16
+                let part_size = if let Some(texture) = state.texture_cache.get(&format!(
+                    "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
+                    part_info.state_name, part_info.rotation
+                )) {
+                    texture.size_vec2() * state.zoom_level
+                } else {
+                    egui::vec2(16.0, 16.0) * state.zoom_level
+                };
                 let part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
-                    egui::vec2(part_size, part_size),
+                    part_size,
                 );
                 if part_rect.contains(pos) {
-                    clicked_part = Some(*id);
+                    clicked_part = Some(part_info.id);
                     break;
                 }
             }
@@ -802,12 +1027,32 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     // Handle dragging selected part
+    if response.drag_started() && state.selected_part_id.is_some() {
+        // Initialize accumulator with current position when drag starts
+        if let Some(part) = state.get_selected_placed_part() {
+            state.drag_accumulator = part.position;
+        }
+    }
+
     if response.dragged() && state.selected_part_id.is_some() {
         let delta = response.drag_delta();
         let zoom = state.zoom_level;
+        let pixel_aligned = state.pixel_aligned;
+
+        // Accumulate the true position
+        state.drag_accumulator.0 += delta.x / zoom;
+        state.drag_accumulator.1 += delta.y / zoom;
+
+        // Capture values before mutable borrow
+        let new_pos = if pixel_aligned {
+            (state.drag_accumulator.0.round(), state.drag_accumulator.1.round())
+        } else {
+            state.drag_accumulator
+        };
+
+        // Set the displayed position
         if let Some(part) = state.get_selected_placed_part_mut() {
-            part.position.0 += delta.x / zoom;
-            part.position.1 += delta.y / zoom;
+            part.position = new_pos;
         }
     }
 
@@ -1037,38 +1282,48 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
 
     // Import Image dialog
     if state.show_import_image_dialog {
-        egui::Window::new("Import Rotation Images")
+        egui::Window::new("Import Rotation Image")
             .collapsible(false)
             .resizable(false)
             .min_width(400.0)
             .show(ctx, |ui| {
+                // Show what we're importing to
+                if let (Some(ref char_name), Some(ref part_name), Some(ref state_name)) =
+                    (&state.selected_character_for_part, &state.selected_part_for_state, &state.selected_state_for_import)
+                {
+                    ui.label(format!("Importing to: {} / {} / {} @ {}°",
+                        char_name, part_name, state_name, state.selected_rotation_for_import));
+                }
+                ui.separator();
+
                 ui.label("Enter path to PNG image:");
                 ui.text_edit_singleline(&mut state.import_image_path);
-                ui.label("Image will be imported for the selected state.");
 
                 ui.horizontal(|ui| {
                     if ui.button("Import").clicked() && !state.import_image_path.is_empty() {
                         let path = state.import_image_path.clone();
+                        let rotation_angle = state.selected_rotation_for_import;
                         match import_image_as_base64(&path) {
                             Ok(base64_data) => {
-                                // Import to selected state at rotation 0
-                                if let (Some(ref char_name), Some(ref part_name)) =
-                                    (&state.selected_character_for_part, &state.selected_part_for_state)
+                                if let (Some(ref char_name), Some(ref part_name), Some(ref state_name)) =
+                                    (&state.selected_character_for_part, &state.selected_part_for_state, &state.selected_state_for_import)
                                 {
                                     if let Some(ref mut project) = state.project {
                                         if let Some(character) = project.get_character_mut(char_name) {
                                             if let Some(part) = character.get_part_mut(part_name) {
-                                                if let Some(state_obj) = part.states.first_mut() {
-                                                    if let Some(rotation) = state_obj.rotations.get_mut(&0) {
+                                                if let Some(state_obj) = part.states.iter_mut().find(|s| s.name == *state_name) {
+                                                    if let Some(rotation) = state_obj.rotations.get_mut(&rotation_angle) {
                                                         rotation.image_data = Some(base64_data);
-                                                        state.set_status("Image imported for 0° rotation");
+                                                        state.set_status(format!("Image imported for {}° rotation", rotation_angle));
+                                                        // Clear texture cache so it gets reloaded
+                                                        state.texture_cache.clear();
                                                     }
                                                 }
                                             }
                                         }
                                     }
                                 } else {
-                                    state.set_status("Select a character and part first");
+                                    state.set_status("Missing selection context");
                                 }
                             }
                             Err(e) => {
@@ -1076,9 +1331,15 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                             }
                         }
                         state.show_import_image_dialog = false;
+                        state.selected_character_for_part = None;
+                        state.selected_part_for_state = None;
+                        state.selected_state_for_import = None;
                     }
                     if ui.button("Cancel").clicked() {
                         state.show_import_image_dialog = false;
+                        state.selected_character_for_part = None;
+                        state.selected_part_for_state = None;
+                        state.selected_state_for_import = None;
                     }
                 });
             });
@@ -1098,4 +1359,36 @@ fn import_image_as_base64(path: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to encode PNG: {}", e))?;
 
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes))
+}
+
+fn decode_base64_to_texture(
+    ctx: &egui::Context,
+    name: &str,
+    base64_data: &str,
+) -> Result<egui::TextureHandle, String> {
+    use base64::Engine;
+
+    // Decode base64
+    let png_bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| format!("Failed to decode base64: {}", e))?;
+
+    // Load image
+    let img = image::load_from_memory(&png_bytes)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // Convert to RGBA
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+
+    // Create egui ColorImage
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+
+    // Create texture
+    Ok(ctx.load_texture(
+        name,
+        color_image,
+        egui::TextureOptions::NEAREST, // Pixel art should use nearest neighbor
+    ))
 }
