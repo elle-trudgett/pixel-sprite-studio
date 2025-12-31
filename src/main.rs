@@ -10,6 +10,8 @@ use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use rfd::FileDialog;
 
+const ZOOM_LEVELS: [f32; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -35,6 +37,7 @@ struct AppState {
 
     // UI state
     show_grid: bool,
+    show_labels: bool,
     zoom_level: f32,
     current_animation: usize,
     current_frame: usize,
@@ -88,7 +91,8 @@ impl AppState {
             project: None,
             project_path: None,
             show_grid: true,
-            zoom_level: 4.0,
+            show_labels: true,
+            zoom_level: 1.0,
             current_animation: 0,
             current_frame: 0,
             is_playing: false,
@@ -215,6 +219,26 @@ impl AppState {
     fn total_frames(&self) -> usize {
         self.current_animation().map(|a| a.frames.len()).unwrap_or(1)
     }
+
+    fn zoom_in(&mut self) {
+        // Find next higher zoom level
+        for &level in &ZOOM_LEVELS {
+            if level > self.zoom_level {
+                self.zoom_level = level;
+                return;
+            }
+        }
+    }
+
+    fn zoom_out(&mut self) {
+        // Find next lower zoom level
+        for &level in ZOOM_LEVELS.iter().rev() {
+            if level < self.zoom_level {
+                self.zoom_level = level;
+                return;
+            }
+        }
+    }
 }
 
 // Native file dialog functions (Windows only)
@@ -330,20 +354,22 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
             });
 
             ui.menu_button("View", |ui| {
-                ui.checkbox(&mut state.show_grid, "Show Grid");
+                ui.horizontal(|ui| {
+                    ui.label("Zoom:");
+                    egui::ComboBox::from_id_salt("zoom_level")
+                        .selected_text(format!("{:.2}x", state.zoom_level))
+                        .show_ui(ui, |ui| {
+                            for &level in &ZOOM_LEVELS {
+                                let label = format!("{:.2}x", level);
+                                if ui.selectable_value(&mut state.zoom_level, level, &label).clicked() {
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                });
                 ui.separator();
-                if ui.button("Zoom In").clicked() {
-                    state.zoom_level = (state.zoom_level * 1.5).min(16.0);
-                    ui.close_menu();
-                }
-                if ui.button("Zoom Out").clicked() {
-                    state.zoom_level = (state.zoom_level / 1.5).max(0.5);
-                    ui.close_menu();
-                }
-                if ui.button("Reset Zoom (4x)").clicked() {
-                    state.zoom_level = 4.0;
-                    ui.close_menu();
-                }
+                ui.checkbox(&mut state.show_grid, "Show Grid");
+                ui.checkbox(&mut state.show_labels, "Show Labels");
             });
 
             let has_project = state.project.is_some();
@@ -651,17 +677,6 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                         });
                 });
 
-                // Z-Index override
-                let mut z = z_override.unwrap_or(0);
-                ui.horizontal(|ui| {
-                    ui.label("Z-Index:");
-                    if ui.add(egui::DragValue::new(&mut z).speed(1)).changed() {
-                        if let Some(part) = state.get_selected_placed_part_mut() {
-                            part.z_override = Some(z);
-                        }
-                    }
-                });
-
                 ui.separator();
                 if ui.button("Delete Part").clicked() {
                     state.delete_selected_part();
@@ -673,6 +688,77 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                 ui.label("Click 'Place' next to a part");
                 ui.label("in the asset browser, then");
                 ui.label("click and drag on the canvas.");
+            }
+
+            ui.separator();
+
+            // Layers panel - shows all parts in current frame
+            ui.heading("Layers");
+
+            // Get layers for current frame (need to collect info for UI)
+            let layers: Vec<(u64, String, usize)> = {
+                if let Some(ref project) = state.project {
+                    if let Some(anim) = project.animations.get(state.current_animation) {
+                        if let Some(frame) = anim.frames.get(state.current_frame) {
+                            frame.placed_parts.iter().enumerate()
+                                .map(|(idx, p)| (p.id, p.part_name.clone(), idx))
+                                .collect()
+                        } else { vec![] }
+                    } else { vec![] }
+                } else { vec![] }
+            };
+
+            if layers.is_empty() {
+                ui.label("(No layers)");
+            } else {
+                // Show layers in reverse order (top layer first in UI)
+                let mut move_up: Option<usize> = None;
+                let mut move_down: Option<usize> = None;
+
+                for (id, name, idx) in layers.iter().rev() {
+                    let is_selected = state.selected_part_id == Some(*id);
+                    ui.horizontal(|ui| {
+                        // Layer selection
+                        if ui.selectable_label(is_selected, &format!("{}", name)).clicked() {
+                            state.selected_part_id = Some(*id);
+                        }
+
+                        // Move up (toward end of list = drawn on top)
+                        if ui.small_button("↑").clicked() && *idx < layers.len() - 1 {
+                            move_up = Some(*idx);
+                        }
+                        // Move down (toward start of list = drawn below)
+                        if ui.small_button("↓").clicked() && *idx > 0 {
+                            move_down = Some(*idx);
+                        }
+                    });
+                }
+
+                // Apply layer reordering
+                let current_anim = state.current_animation;
+                let current_frame_idx = state.current_frame;
+                if let Some(idx) = move_up {
+                    if let Some(ref mut project) = state.project {
+                        if let Some(anim) = project.animations.get_mut(current_anim) {
+                            if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                if idx + 1 < frame.placed_parts.len() {
+                                    frame.placed_parts.swap(idx, idx + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(idx) = move_down {
+                    if let Some(ref mut project) = state.project {
+                        if let Some(anim) = project.animations.get_mut(current_anim) {
+                            if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                if idx > 0 {
+                                    frame.placed_parts.swap(idx, idx - 1);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             ui.separator();
@@ -692,8 +778,16 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Zoom:");
-                    ui.add(egui::Slider::new(&mut state.zoom_level, 0.5..=16.0).logarithmic(true));
+                    egui::ComboBox::from_id_salt("zoom_level_canvas")
+                        .selected_text(format!("{:.2}x", state.zoom_level))
+                        .show_ui(ui, |ui| {
+                            for &level in &ZOOM_LEVELS {
+                                ui.selectable_value(&mut state.zoom_level, level, format!("{:.2}x", level));
+                            }
+                        });
                 });
+                ui.checkbox(&mut state.show_grid, "Show grid");
+                ui.checkbox(&mut state.show_labels, "Show labels");
             });
 
             if let Some(ref mut project) = state.project {
@@ -870,8 +964,11 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     };
 
     let available = ui.available_size();
-    let canvas_w = canvas_size.0 as f32 * state.zoom_level;
-    let canvas_h = canvas_size.1 as f32 * state.zoom_level;
+    // Account for DPI scaling to get true 1:1 pixel rendering at zoom 1.0
+    let ppp = ui.ctx().pixels_per_point();
+    let effective_zoom = state.zoom_level / ppp;
+    let canvas_w = canvas_size.0 as f32 * effective_zoom;
+    let canvas_h = canvas_size.1 as f32 * effective_zoom;
 
     // Center the canvas
     let offset_x = (available.x - canvas_w) / 2.0;
@@ -889,7 +986,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     // Draw grid if enabled
     if state.show_grid {
         let grid_color = egui::Color32::from_rgba_unmultiplied(100, 100, 100, 60);
-        let cell_size = state.zoom_level;
+        let cell_size = effective_zoom;
 
         let mut x = canvas_rect.min.x;
         while x <= canvas_rect.max.x {
@@ -910,10 +1007,18 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Draw placed parts
+    // Canvas border (draw before sprites so it appears underneath)
+    painter.rect_stroke(
+        canvas_rect,
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 100, 120)),
+    );
+
+    // Draw placed parts (in list order - later items drawn on top)
+    let show_labels = state.show_labels;
     for part_info in &placed_parts {
-        let screen_x = canvas_rect.min.x + part_info.position.0 * state.zoom_level;
-        let screen_y = canvas_rect.min.y + part_info.position.1 * state.zoom_level;
+        let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
+        let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
 
         let is_selected = state.selected_part_id == Some(part_info.id);
 
@@ -923,6 +1028,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
         let mut rendered_texture = false;
         let mut image_size = (16.0_f32, 16.0_f32);
+        let mut part_rect = egui::Rect::NOTHING;
 
         if let Some(ref base64_data) = part_info.image_data {
             // Check if texture is already cached
@@ -936,8 +1042,8 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             if let Some(texture) = state.texture_cache.get(&texture_key) {
                 let tex_size = texture.size_vec2();
                 image_size = (tex_size.x, tex_size.y);
-                let scaled_size = egui::vec2(tex_size.x * state.zoom_level, tex_size.y * state.zoom_level);
-                let part_rect = egui::Rect::from_min_size(
+                let scaled_size = egui::vec2(tex_size.x * effective_zoom, tex_size.y * effective_zoom);
+                part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
                     scaled_size,
                 );
@@ -950,20 +1056,15 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     egui::Color32::WHITE,
                 );
 
-                // Draw selection border
-                if is_selected {
-                    painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
-                }
-
                 rendered_texture = true;
             }
         }
 
         // Fallback: draw colored rectangle if no texture
         if !rendered_texture {
-            let part_size_x = image_size.0 * state.zoom_level;
-            let part_size_y = image_size.1 * state.zoom_level;
-            let part_rect = egui::Rect::from_min_size(
+            let part_size_x = image_size.0 * effective_zoom;
+            let part_size_y = image_size.1 * effective_zoom;
+            part_rect = egui::Rect::from_min_size(
                 egui::pos2(screen_x, screen_y),
                 egui::vec2(part_size_x, part_size_y),
             );
@@ -975,23 +1076,51 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             let b = ((hash * 47) % 200 + 55) as u8;
 
             let fill_color = egui::Color32::from_rgba_unmultiplied(r, g, b, 180);
-            let stroke_color = if is_selected {
-                egui::Color32::YELLOW
-            } else {
-                egui::Color32::WHITE
-            };
-            let stroke_width = if is_selected { 3.0 } else { 1.0 };
-
             painter.rect_filled(part_rect, 2.0, fill_color);
-            painter.rect_stroke(part_rect, 2.0, egui::Stroke::new(stroke_width, stroke_color));
 
-            // Draw part name
+            // Draw part name in center
             painter.text(
                 part_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 &part_info.part_name,
                 egui::FontId::proportional(10.0),
                 egui::Color32::WHITE,
+            );
+        }
+
+        // Draw selection border (yellow) or label border (red)
+        if is_selected {
+            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+        } else if show_labels {
+            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::RED));
+        }
+
+        // Draw label box in top-left corner if show_labels is enabled
+        if show_labels {
+            let label_text = &part_info.part_name;
+            let font = egui::FontId::proportional(10.0);
+            let text_color = egui::Color32::WHITE;
+            let bg_color = egui::Color32::from_rgba_unmultiplied(200, 0, 0, 220);
+
+            // Measure text size
+            let galley = painter.layout_no_wrap(label_text.clone(), font.clone(), text_color);
+            let text_size = galley.size();
+            let padding = 2.0;
+
+            let label_height = text_size.y + padding * 2.0;
+            let label_rect = egui::Rect::from_min_size(
+                egui::pos2(part_rect.min.x, part_rect.min.y - label_height),
+                egui::vec2(text_size.x + padding * 2.0, label_height),
+            );
+
+            // Draw label background
+            painter.rect_filled(label_rect, 0.0, bg_color);
+
+            // Draw label text
+            painter.galley(
+                egui::pos2(label_rect.min.x + padding, label_rect.min.y + padding),
+                galley,
+                text_color,
             );
         }
     }
@@ -1002,16 +1131,16 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             // Check if we clicked on a part
             let mut clicked_part = None;
             for part_info in placed_parts.iter().rev() { // Reverse for top-to-bottom
-                let screen_x = canvas_rect.min.x + part_info.position.0 * state.zoom_level;
-                let screen_y = canvas_rect.min.y + part_info.position.1 * state.zoom_level;
+                let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
+                let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
                 // Use cached texture size if available, otherwise default 16x16
                 let part_size = if let Some(texture) = state.texture_cache.get(&format!(
                     "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
                     part_info.state_name, part_info.rotation
                 )) {
-                    texture.size_vec2() * state.zoom_level
+                    texture.size_vec2() * effective_zoom
                 } else {
-                    egui::vec2(16.0, 16.0) * state.zoom_level
+                    egui::vec2(16.0, 16.0) * effective_zoom
                 };
                 let part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
@@ -1036,7 +1165,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
     if response.dragged() && state.selected_part_id.is_some() {
         let delta = response.drag_delta();
-        let zoom = state.zoom_level;
+        let zoom = effective_zoom;
         let pixel_aligned = state.pixel_aligned;
 
         // Accumulate the true position
@@ -1056,12 +1185,15 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Canvas border
-    painter.rect_stroke(
-        canvas_rect,
-        0.0,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 100, 120)),
-    );
+    // Handle mouse wheel for zooming
+    if response.hovered() {
+        let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll_delta > 0.0 {
+            state.zoom_in();
+        } else if scroll_delta < 0.0 {
+            state.zoom_out();
+        }
+    }
 
     // Canvas info overlay
     let parts_count = placed_parts.len();
