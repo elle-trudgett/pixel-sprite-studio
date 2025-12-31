@@ -10,7 +10,15 @@ use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use rfd::FileDialog;
 
-const ZOOM_LEVELS: [f32; 7] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+const ZOOM_LEVELS: [f32; 10] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+/// Active tab in the central panel
+#[derive(Debug, Clone, PartialEq, Default)]
+enum ActiveTab {
+    #[default]
+    Canvas,
+    CharacterEditor(String), // Character name being edited
+}
 
 fn main() {
     App::new()
@@ -44,6 +52,16 @@ struct AppState {
     is_playing: bool,
     selected_part_id: Option<u64>,
     pixel_aligned: bool,
+    canvas_offset: (f32, f32), // Pan offset for canvas
+    is_panning: bool, // True when space or middle mouse is held
+
+    // Per-character animation state
+    active_character: Option<String>, // Currently selected character
+    active_tab: ActiveTab, // Canvas or CharacterEditor
+
+    // Character editor state
+    editor_selected_part: Option<String>,
+    editor_selected_state: Option<String>,
 
     // Dragging state
     dragging_part: Option<DraggedPart>,
@@ -58,6 +76,10 @@ struct AppState {
     show_save_dialog: bool,
     show_load_dialog: bool,
     show_import_image_dialog: bool,
+    show_import_rotation_dialog: bool,
+
+    // Rotation import state (from character editor)
+    pending_rotation_import: Option<u16>,
 
     // Dialog input buffers
     new_character_name: String,
@@ -92,12 +114,18 @@ impl AppState {
             project_path: None,
             show_grid: true,
             show_labels: true,
-            zoom_level: 1.0,
+            zoom_level: 16.0,
             current_animation: 0,
             current_frame: 0,
             is_playing: false,
             selected_part_id: None,
             pixel_aligned: true,
+            canvas_offset: (0.0, 0.0),
+            is_panning: false,
+            active_character: None,
+            active_tab: ActiveTab::Canvas,
+            editor_selected_part: None,
+            editor_selected_state: None,
             dragging_part: None,
             drag_offset: (0.0, 0.0),
             drag_accumulator: (0.0, 0.0),
@@ -108,6 +136,8 @@ impl AppState {
             show_save_dialog: false,
             show_load_dialog: false,
             show_import_image_dialog: false,
+            show_import_rotation_dialog: false,
+            pending_rotation_import: None,
             new_character_name: String::new(),
             new_part_name: String::new(),
             new_state_name: String::new(),
@@ -124,16 +154,23 @@ impl AppState {
     }
 
     fn place_part_on_canvas(&mut self, character: &str, part: &str, state: &str, x: f32, y: f32) {
+        let current_anim = self.current_animation;
+        let current_frame = self.current_frame;
+        let char_name = self.active_character.clone();
+
         if let Some(ref mut project) = self.project {
             let id = project.next_id();
-            let placed = PlacedPart::new(id, character, part, state);
-            let mut placed = placed;
+            let mut placed = PlacedPart::new(id, character, part, state);
             placed.position = (x, y);
 
-            if let Some(anim) = project.animations.get_mut(self.current_animation) {
-                if let Some(frame) = anim.frames.get_mut(self.current_frame) {
-                    frame.placed_parts.push(placed);
-                    self.selected_part_id = Some(id);
+            if let Some(ref char_name) = char_name {
+                if let Some(character_obj) = project.get_character_mut(char_name) {
+                    if let Some(anim) = character_obj.animations.get_mut(current_anim) {
+                        if let Some(frame) = anim.frames.get_mut(current_frame) {
+                            frame.placed_parts.push(placed);
+                            self.selected_part_id = Some(id);
+                        }
+                    }
                 }
             }
         }
@@ -141,27 +178,25 @@ impl AppState {
 
     fn get_selected_placed_part(&self) -> Option<&PlacedPart> {
         let id = self.selected_part_id?;
-        let project = self.project.as_ref()?;
-        let anim = project.animations.get(self.current_animation)?;
+        let anim = self.current_animation()?;
         let frame = anim.frames.get(self.current_frame)?;
         frame.placed_parts.iter().find(|p| p.id == id)
     }
 
     fn get_selected_placed_part_mut(&mut self) -> Option<&mut PlacedPart> {
         let id = self.selected_part_id?;
-        let project = self.project.as_mut()?;
-        let anim = project.animations.get_mut(self.current_animation)?;
-        let frame = anim.frames.get_mut(self.current_frame)?;
+        let frame_idx = self.current_frame;
+        let anim = self.current_animation_mut()?;
+        let frame = anim.frames.get_mut(frame_idx)?;
         frame.placed_parts.iter_mut().find(|p| p.id == id)
     }
 
     fn delete_selected_part(&mut self) {
         if let Some(id) = self.selected_part_id {
-            if let Some(ref mut project) = self.project {
-                if let Some(anim) = project.animations.get_mut(self.current_animation) {
-                    if let Some(frame) = anim.frames.get_mut(self.current_frame) {
-                        frame.placed_parts.retain(|p| p.id != id);
-                    }
+            let frame_idx = self.current_frame;
+            if let Some(anim) = self.current_animation_mut() {
+                if let Some(frame) = anim.frames.get_mut(frame_idx) {
+                    frame.placed_parts.retain(|p| p.id != id);
                 }
             }
             self.selected_part_id = None;
@@ -208,12 +243,23 @@ impl AppState {
         self.selected_part_id = None;
     }
 
+    fn active_character_ref(&self) -> Option<&Character> {
+        let char_name = self.active_character.as_ref()?;
+        self.project.as_ref()?.get_character(char_name)
+    }
+
+    fn active_character_mut(&mut self) -> Option<&mut Character> {
+        let char_name = self.active_character.clone()?;
+        self.project.as_mut()?.get_character_mut(&char_name)
+    }
+
     fn current_animation(&self) -> Option<&Animation> {
-        self.project.as_ref()?.animations.get(self.current_animation)
+        self.active_character_ref()?.animations.get(self.current_animation)
     }
 
     fn current_animation_mut(&mut self) -> Option<&mut Animation> {
-        self.project.as_mut()?.animations.get_mut(self.current_animation)
+        let anim_idx = self.current_animation;
+        self.active_character_mut()?.animations.get_mut(anim_idx)
     }
 
     fn total_frames(&self) -> usize {
@@ -444,141 +490,80 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
         }
     });
 
-    // Asset browser (left panel)
+    // Asset browser (left panel) - Simplified: flat character list + animations
     egui::SidePanel::left("asset_browser")
         .default_width(250.0)
         .min_width(200.0)
         .resizable(true)
         .show(ctx, |ui| {
-            ui.heading("Asset Browser");
+            ui.heading("Characters");
             ui.separator();
 
             if let Some(ref project) = state.project.clone() {
-                // Characters tree
-                egui::CollapsingHeader::new("Characters")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        if project.characters.is_empty() {
-                            ui.label("  (No characters)");
+                // Flat character list
+                if project.characters.is_empty() {
+                    ui.label("(No characters)");
+                }
+                for character in &project.characters {
+                    let char_name = character.name.clone();
+                    let is_active = state.active_character.as_ref() == Some(&char_name);
+
+                    ui.horizontal(|ui| {
+                        // Character name - click to select as active
+                        let label = if is_active {
+                            egui::RichText::new(&character.name).strong()
+                        } else {
+                            egui::RichText::new(&character.name)
+                        };
+                        if ui.selectable_label(is_active, label).clicked() {
+                            state.active_character = Some(char_name.clone());
+                            state.current_animation = 0;
+                            state.current_frame = 0;
                         }
-                        for character in &project.characters {
-                            let char_name = character.name.clone();
-                            egui::CollapsingHeader::new(&character.name)
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    for part in &character.parts {
-                                        let part_name = part.name.clone();
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("  {}", &part.name));
-                                            if ui.small_button("Place").clicked() {
-                                                // Place part at center of canvas
-                                                let center_x = project.canvas_size.0 as f32 / 2.0 - 8.0;
-                                                let center_y = project.canvas_size.1 as f32 / 2.0 - 8.0;
-                                                let state_name = part.states.first()
-                                                    .map(|s| s.name.clone())
-                                                    .unwrap_or_else(|| "default".to_string());
-                                                state.place_part_on_canvas(&char_name, &part_name, &state_name, center_x, center_y);
-                                                state.set_status(format!("Placed {}", part_name));
-                                            }
-                                        });
-                                        egui::CollapsingHeader::new(format!("    States"))
-                                            .id_salt(format!("{}-{}-states", char_name, part_name))
-                                            .default_open(false)
-                                            .show(ui, |ui| {
-                                                for state_item in &part.states {
-                                                    let state_name = state_item.name.clone();
-                                                    let has_images = state_item.has_images();
-                                                    egui::CollapsingHeader::new(format!("      {} {}", &state_item.name, if has_images { "✓" } else { "" }))
-                                                        .id_salt(format!("{}-{}-{}-rotations", char_name, part_name, state_name))
-                                                        .default_open(false)
-                                                        .show(ui, |ui| {
-                                                            // Show all rotation angles
-                                                            for angle in state_item.rotation_mode.angles() {
-                                                                let has_image = state_item.rotations.get(&angle)
-                                                                    .map(|r| r.image_data.is_some())
-                                                                    .unwrap_or(false);
-                                                                ui.horizontal(|ui| {
-                                                                    ui.label(format!("        {}°", angle));
-                                                                    if has_image {
-                                                                        ui.label("✓");
-                                                                    }
-                                                                    if ui.small_button("Import").clicked() {
-                                                                        // Try native file dialog first
-                                                                        if let Some(path) = pick_image_file() {
-                                                                            let path_str = path.to_string_lossy().to_string();
-                                                                            match import_image_as_base64(&path_str) {
-                                                                                Ok(base64_data) => {
-                                                                                    if let Some(ref mut project) = state.project {
-                                                                                        if let Some(character) = project.get_character_mut(&char_name) {
-                                                                                            if let Some(part) = character.get_part_mut(&part_name) {
-                                                                                                if let Some(state_obj) = part.states.iter_mut().find(|s| s.name == state_name) {
-                                                                                                    if let Some(rotation) = state_obj.rotations.get_mut(&angle) {
-                                                                                                        rotation.image_data = Some(base64_data);
-                                                                                                        state.set_status(format!("Imported image for {}°", angle));
-                                                                                                        state.texture_cache.clear();
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                                Err(e) => state.set_status(format!("Import failed: {}", e)),
-                                                                            }
-                                                                        } else {
-                                                                            // Fallback to text input dialog
-                                                                            state.show_import_image_dialog = true;
-                                                                            state.import_image_path.clear();
-                                                                            state.selected_character_for_part = Some(char_name.clone());
-                                                                            state.selected_part_for_state = Some(part_name.clone());
-                                                                            state.selected_state_for_import = Some(state_name.clone());
-                                                                            state.selected_rotation_for_import = angle;
-                                                                        }
-                                                                    }
-                                                                });
-                                                            }
-                                                        });
-                                                }
-                                                if ui.small_button("+ State").clicked() {
-                                                    state.show_new_state_dialog = true;
-                                                    state.new_state_name.clear();
-                                                    state.selected_character_for_part = Some(char_name.clone());
-                                                    state.selected_part_for_state = Some(part_name.clone());
-                                                }
-                                            });
-                                    }
-                                    if ui.small_button("+ Part").clicked() {
-                                        state.show_new_part_dialog = true;
-                                        state.new_part_name.clear();
-                                        state.selected_character_for_part = Some(char_name.clone());
-                                    }
-                                });
-                        }
-                        ui.separator();
-                        if ui.button("+ New Character").clicked() {
-                            state.show_new_character_dialog = true;
-                            state.new_character_name.clear();
+
+                        // Edit button - opens character editor tab
+                        if ui.small_button("Edit").clicked() {
+                            state.active_character = Some(char_name.clone());
+                            state.active_tab = ActiveTab::CharacterEditor(char_name.clone());
+                            state.editor_selected_part = character.parts.first().map(|p| p.name.clone());
+                            state.editor_selected_state = None;
                         }
                     });
+                }
 
                 ui.separator();
+                if ui.button("+ New Character").clicked() {
+                    state.show_new_character_dialog = true;
+                    state.new_character_name.clear();
+                }
 
-                // Animations list
-                egui::CollapsingHeader::new("Animations")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for (i, anim) in project.animations.iter().enumerate() {
+                ui.add_space(10.0);
+
+                // Animations for active character
+                if let Some(ref active_char_name) = state.active_character.clone() {
+                    if let Some(character) = project.get_character(&active_char_name) {
+                        ui.heading(format!("Animations"));
+                        ui.label(format!("({})", active_char_name));
+                        ui.separator();
+
+                        for (i, anim) in character.animations.iter().enumerate() {
                             let selected = i == state.current_animation;
                             if ui.selectable_label(selected, &anim.name).clicked() {
                                 state.current_animation = i;
                                 state.current_frame = 0;
                             }
                         }
+
                         ui.separator();
                         if ui.button("+ New Animation").clicked() {
                             state.show_new_animation_dialog = true;
                             state.new_animation_name.clear();
                         }
-                    });
+                    }
+                } else {
+                    ui.label("");
+                    ui.label("Select a character to see animations");
+                }
             } else {
                 ui.label("No project loaded");
                 ui.label("");
@@ -697,13 +682,11 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
 
             // Get layers for current frame (need to collect info for UI)
             let layers: Vec<(u64, String, usize)> = {
-                if let Some(ref project) = state.project {
-                    if let Some(anim) = project.animations.get(state.current_animation) {
-                        if let Some(frame) = anim.frames.get(state.current_frame) {
-                            frame.placed_parts.iter().enumerate()
-                                .map(|(idx, p)| (p.id, p.part_name.clone(), idx))
-                                .collect()
-                        } else { vec![] }
+                if let Some(anim) = state.current_animation() {
+                    if let Some(frame) = anim.frames.get(state.current_frame) {
+                        frame.placed_parts.iter().enumerate()
+                            .map(|(idx, p)| (p.id, p.part_name.clone(), idx))
+                            .collect()
                     } else { vec![] }
                 } else { vec![] }
             };
@@ -724,11 +707,11 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                         }
 
                         // Move up (toward end of list = drawn on top)
-                        if ui.small_button("↑").clicked() && *idx < layers.len() - 1 {
+                        if ui.small_button("^").clicked() && *idx < layers.len() - 1 {
                             move_up = Some(*idx);
                         }
                         // Move down (toward start of list = drawn below)
-                        if ui.small_button("↓").clicked() && *idx > 0 {
+                        if ui.small_button("v").clicked() && *idx > 0 {
                             move_down = Some(*idx);
                         }
                     });
@@ -737,12 +720,17 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                 // Apply layer reordering
                 let current_anim = state.current_animation;
                 let current_frame_idx = state.current_frame;
+                let active_char = state.active_character.clone();
                 if let Some(idx) = move_up {
                     if let Some(ref mut project) = state.project {
-                        if let Some(anim) = project.animations.get_mut(current_anim) {
-                            if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
-                                if idx + 1 < frame.placed_parts.len() {
-                                    frame.placed_parts.swap(idx, idx + 1);
+                        if let Some(ref char_name) = active_char {
+                            if let Some(character) = project.get_character_mut(char_name) {
+                                if let Some(anim) = character.animations.get_mut(current_anim) {
+                                    if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                        if idx + 1 < frame.placed_parts.len() {
+                                            frame.placed_parts.swap(idx, idx + 1);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -750,10 +738,14 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                 }
                 if let Some(idx) = move_down {
                     if let Some(ref mut project) = state.project {
-                        if let Some(anim) = project.animations.get_mut(current_anim) {
-                            if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
-                                if idx > 0 {
-                                    frame.placed_parts.swap(idx, idx - 1);
+                        if let Some(ref char_name) = active_char {
+                            if let Some(character) = project.get_character_mut(char_name) {
+                                if let Some(anim) = character.animations.get_mut(current_anim) {
+                                    if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                        if idx > 0 {
+                                            frame.placed_parts.swap(idx, idx - 1);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -894,7 +886,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
             ui.label("  Tracks: (drag parts here to animate)");
         });
 
-    // Central canvas area
+    // Central canvas area with tabs
     egui::CentralPanel::default().show(ctx, |ui| {
         if state.project.is_none() {
             ui.centered_and_justified(|ui| {
@@ -909,9 +901,268 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                 });
             });
         } else {
-            render_canvas(ui, &mut state);
+            // Tab bar
+            ui.horizontal(|ui| {
+                // Canvas tab (always present)
+                let is_canvas = matches!(state.active_tab, ActiveTab::Canvas);
+                if ui.selectable_label(is_canvas, "Canvas").clicked() {
+                    state.active_tab = ActiveTab::Canvas;
+                }
+
+                // Character editor tab (if open)
+                if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                    ui.separator();
+                    let _ = ui.selectable_label(true, format!("Edit: {}", char_name));
+                    if ui.small_button("x").clicked() {
+                        state.active_tab = ActiveTab::Canvas;
+                    }
+                }
+            });
+            ui.separator();
+
+            // Tab content
+            match &state.active_tab.clone() {
+                ActiveTab::Canvas => render_canvas(ui, &mut state),
+                ActiveTab::CharacterEditor(char_name) => {
+                    let name = char_name.clone();
+                    render_character_editor(ui, &mut state, &name);
+                }
+            }
         }
     });
+}
+
+/// Character editor with parts, states, and circular rotation wheel
+fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_name: &str) {
+    // Don't process interactions if a dialog is open
+    if state.show_new_part_dialog || state.show_new_state_dialog || state.show_import_rotation_dialog {
+        ui.set_enabled(false);
+    }
+
+    // Get character data
+    let (parts, selected_part_states, selected_state_rotations) = {
+        let Some(ref project) = state.project else {
+            ui.label("No project loaded");
+            return;
+        };
+        let Some(character) = project.get_character(char_name) else {
+            ui.label(format!("Character '{}' not found", char_name));
+            return;
+        };
+
+        let parts: Vec<String> = character.parts.iter().map(|p| p.name.clone()).collect();
+
+        let selected_part_states: Vec<(String, bool)> = state.editor_selected_part.as_ref()
+            .and_then(|pn| character.get_part(pn))
+            .map(|p| p.states.iter().map(|s| {
+                let has_images = s.rotations.values().any(|r| r.image_data.is_some());
+                (s.name.clone(), has_images)
+            }).collect())
+            .unwrap_or_default();
+
+        let selected_state_rotations: Vec<(u16, bool)> = state.editor_selected_part.as_ref()
+            .and_then(|pn| character.get_part(pn))
+            .and_then(|p| {
+                let state_name = state.editor_selected_state.as_ref()
+                    .or(p.states.first().map(|s| &s.name))?;
+                p.states.iter().find(|s| &s.name == state_name)
+            })
+            .map(|s| s.rotations.iter().map(|(angle, r)| (*angle, r.image_data.is_some())).collect())
+            .unwrap_or_default();
+
+        (parts, selected_part_states, selected_state_rotations)
+    };
+
+    // Three-column layout
+    ui.horizontal(|ui| {
+        // Parts column
+        ui.vertical(|ui| {
+            ui.set_min_width(120.0);
+            ui.heading("Parts");
+            ui.separator();
+
+            if parts.is_empty() {
+                ui.label("(No parts)");
+            }
+            for part_name in &parts {
+                let is_selected = state.editor_selected_part.as_ref() == Some(part_name);
+                if ui.selectable_label(is_selected, part_name).clicked() {
+                    state.editor_selected_part = Some(part_name.clone());
+                    state.editor_selected_state = None;
+                }
+            }
+
+            ui.separator();
+            if ui.button("+ Add Part").clicked() {
+                state.show_new_part_dialog = true;
+                state.new_part_name.clear();
+            }
+        });
+
+        ui.separator();
+
+        // States column
+        ui.vertical(|ui| {
+            ui.set_min_width(120.0);
+            ui.heading("States");
+            ui.separator();
+
+            if let Some(ref part_name) = state.editor_selected_part.clone() {
+                if selected_part_states.is_empty() {
+                    ui.label("(No states)");
+                }
+                for (state_name, has_images) in &selected_part_states {
+                    let is_selected = state.editor_selected_state.as_ref() == Some(state_name)
+                        || (state.editor_selected_state.is_none()
+                            && selected_part_states.first().map(|(n, _)| n) == Some(state_name));
+
+                    let label = if *has_images {
+                        egui::RichText::new(state_name).strong()
+                    } else {
+                        egui::RichText::new(state_name)
+                    };
+
+                    if ui.selectable_label(is_selected, label).clicked() {
+                        state.editor_selected_state = Some(state_name.clone());
+                    }
+                }
+
+                ui.separator();
+                if ui.button("+ Add State").clicked() {
+                    state.show_new_state_dialog = true;
+                    state.new_state_name.clear();
+                }
+            } else {
+                ui.label("Select a part");
+            }
+        });
+
+        ui.separator();
+
+        // Rotation wheel column
+        ui.vertical(|ui| {
+            ui.heading("Rotations");
+            ui.separator();
+
+            if state.editor_selected_part.is_some() {
+                render_rotation_wheel(ui, state, char_name, &selected_state_rotations);
+            } else {
+                ui.label("Select a part and state");
+            }
+        });
+    });
+}
+
+/// Renders a circular rotation wheel for importing/viewing rotation sprites
+fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, _char_name: &str, rotations: &[(u16, bool)]) {
+    // Push a unique ID scope for this wheel instance
+    let part_name = state.editor_selected_part.as_deref().unwrap_or("none");
+    let state_name = state.editor_selected_state.as_deref().unwrap_or("default");
+    ui.push_id(format!("rot_wheel_{}_{}", part_name, state_name), |ui| {
+    let available = ui.available_size();
+    let center_x = available.x.min(400.0) / 2.0;
+    let center_y = 200.0; // Fixed height for the wheel area
+    let radius = 80.0;
+    let slot_size = 48.0;
+
+    // Reserve space for the wheel
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(available.x.min(400.0), center_y * 2.0),
+        egui::Sense::hover(),
+    );
+
+    let center = response.rect.center();
+
+    // Get the angles - default to 8 rotations (45 degree mode)
+    let angles: Vec<u16> = if rotations.is_empty() {
+        vec![0, 45, 90, 135, 180, 225, 270, 315]
+    } else {
+        let mut sorted: Vec<u16> = rotations.iter().map(|(a, _)| *a).collect();
+        sorted.sort();
+        sorted
+    };
+
+    // Create a map of angle -> has_image for quick lookup
+    let rotation_map: std::collections::HashMap<u16, bool> = rotations.iter().cloned().collect();
+
+    // Draw slots in a circle
+    for angle in &angles {
+        // Convert angle to radians - 0° = right (east), going clockwise
+        // In screen coordinates, Y increases downward, so we negate the sin
+        let rad = (*angle as f32).to_radians();
+        let slot_center = center + egui::vec2(rad.cos() * radius, rad.sin() * radius);
+
+        // Slot rectangle
+        let slot_rect = egui::Rect::from_center_size(
+            slot_center,
+            egui::vec2(slot_size, slot_size),
+        );
+
+        let has_image = rotation_map.get(angle).copied().unwrap_or(false);
+
+        // Draw slot background
+        let bg_color = if has_image {
+            egui::Color32::from_rgb(60, 120, 60) // Green for has image
+        } else {
+            egui::Color32::from_rgb(80, 80, 80) // Gray for empty
+        };
+        painter.rect_filled(slot_rect, 4.0, bg_color);
+        painter.rect_stroke(slot_rect, 4.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+
+        // Draw angle label below the slot
+        let label_pos = slot_center + egui::vec2(0.0, slot_size / 2.0 + 10.0);
+        painter.text(
+            label_pos,
+            egui::Align2::CENTER_CENTER,
+            format!("{}°", angle),
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+
+        // Check for click on this slot
+        let slot_response = ui.interact(slot_rect, ui.id().with(("rot_slot", *angle)), egui::Sense::click());
+        if slot_response.clicked() {
+            // Import image for this rotation
+            state.pending_rotation_import = Some(*angle);
+            state.show_import_rotation_dialog = true;
+        }
+
+        if slot_response.hovered() {
+            painter.rect_stroke(slot_rect, 4.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+        }
+    }
+
+    // Draw center label
+    let part_name = state.editor_selected_part.as_deref().unwrap_or("?");
+    let state_name = state.editor_selected_state.as_deref().unwrap_or("default");
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        format!("{}\n{}", part_name, state_name),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
+
+    // Draw compass labels
+    let compass_radius = radius + slot_size / 2.0 + 25.0;
+    let compass_labels = [
+        (0.0_f32, "E (0°)"),
+        (90.0_f32, "S (90°)"),
+        (180.0_f32, "W (180°)"),
+        (270.0_f32, "N (270°)"),
+    ];
+    for (deg, label) in compass_labels {
+        let rad = deg.to_radians();
+        let pos = center + egui::vec2(rad.cos() * compass_radius, rad.sin() * compass_radius);
+        painter.text(
+            pos,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(10.0),
+            egui::Color32::GRAY,
+        );
+    }
+    }); // close push_id
 }
 
 // Info needed for rendering a placed part
@@ -929,36 +1180,35 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     // Capture values from project upfront to avoid borrow conflicts
     let (canvas_size, placed_parts) = {
         let Some(ref project) = state.project else { return };
+        let active_char = state.active_character.as_ref();
 
-        let parts: Vec<PlacedPartRenderInfo> =
-            if let Some(anim) = project.animations.get(state.current_animation) {
-                if let Some(frame) = anim.frames.get(state.current_frame) {
-                    frame.placed_parts.iter()
-                        .map(|p| {
-                            // Look up image data for this part
-                            let image_data = project.get_character(&p.character_name)
-                                .and_then(|c| c.get_part(&p.part_name))
-                                .and_then(|part| part.states.iter().find(|s| s.name == p.state_name))
-                                .and_then(|s| s.rotations.get(&p.rotation))
-                                .and_then(|r| r.image_data.clone());
+        let parts: Vec<PlacedPartRenderInfo> = active_char
+            .and_then(|name| project.get_character(name))
+            .and_then(|c| c.animations.get(state.current_animation))
+            .and_then(|anim| anim.frames.get(state.current_frame))
+            .map(|frame| {
+                frame.placed_parts.iter()
+                    .map(|p| {
+                        // Look up image data for this part
+                        let image_data = project.get_character(&p.character_name)
+                            .and_then(|c| c.get_part(&p.part_name))
+                            .and_then(|part| part.states.iter().find(|s| s.name == p.state_name))
+                            .and_then(|s| s.rotations.get(&p.rotation))
+                            .and_then(|r| r.image_data.clone());
 
-                            PlacedPartRenderInfo {
-                                id: p.id,
-                                part_name: p.part_name.clone(),
-                                character_name: p.character_name.clone(),
-                                state_name: p.state_name.clone(),
-                                rotation: p.rotation,
-                                position: p.position,
-                                image_data,
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
+                        PlacedPartRenderInfo {
+                            id: p.id,
+                            part_name: p.part_name.clone(),
+                            character_name: p.character_name.clone(),
+                            state_name: p.state_name.clone(),
+                            rotation: p.rotation,
+                            position: p.position,
+                            image_data,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         (project.canvas_size, parts)
     };
@@ -970,15 +1220,26 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     let canvas_w = canvas_size.0 as f32 * effective_zoom;
     let canvas_h = canvas_size.1 as f32 * effective_zoom;
 
-    // Center the canvas
-    let offset_x = (available.x - canvas_w) / 2.0;
-    let offset_y = (available.y - canvas_h) / 2.0;
+    // Center the canvas with pan offset
+    let offset_x = (available.x - canvas_w) / 2.0 + state.canvas_offset.0;
+    let offset_y = (available.y - canvas_h) / 2.0 + state.canvas_offset.1;
 
     let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
     let canvas_rect = egui::Rect::from_min_size(
-        response.rect.min + egui::vec2(offset_x.max(0.0), offset_y.max(0.0)),
+        response.rect.min + egui::vec2(offset_x, offset_y),
         egui::vec2(canvas_w, canvas_h),
     );
+
+    // Check for panning input (space key or middle mouse button)
+    let space_held = ui.input(|i| i.key_down(egui::Key::Space));
+    let middle_mouse_held = ui.input(|i| i.pointer.middle_down());
+    let is_panning = space_held || middle_mouse_held;
+    state.is_panning = is_panning;
+
+    // Set cursor to grabbing hand when panning
+    if is_panning {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
 
     // Draw canvas background
     painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(40, 40, 50));
@@ -1125,8 +1386,16 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Handle mouse interactions
-    if response.clicked() {
+    // Handle panning with middle mouse or space+drag
+    if is_panning && response.dragged() {
+        let delta = response.drag_delta();
+        state.canvas_offset.0 += delta.x;
+        state.canvas_offset.1 += delta.y;
+    }
+
+    // Handle mouse interactions - select on mouse down (drag_started) for immediate feedback
+    // Skip if we're panning
+    if !is_panning && response.drag_started() {
         if let Some(pos) = response.interact_pointer_pos() {
             // Check if we clicked on a part
             let mut clicked_part = None;
@@ -1152,18 +1421,46 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             }
             state.selected_part_id = clicked_part;
+
+            // Initialize drag accumulator if we selected a part
+            if let Some(part) = state.get_selected_placed_part() {
+                state.drag_accumulator = part.position;
+            }
         }
     }
 
-    // Handle dragging selected part
-    if response.drag_started() && state.selected_part_id.is_some() {
-        // Initialize accumulator with current position when drag starts
-        if let Some(part) = state.get_selected_placed_part() {
-            state.drag_accumulator = part.position;
+    // Handle click on empty space to deselect (clicked = mouse up without drag)
+    if response.clicked() && state.selected_part_id.is_some() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            // Check if we clicked on empty space
+            let mut on_part = false;
+            for part_info in placed_parts.iter() {
+                let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
+                let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
+                let part_size = if let Some(texture) = state.texture_cache.get(&format!(
+                    "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
+                    part_info.state_name, part_info.rotation
+                )) {
+                    texture.size_vec2() * effective_zoom
+                } else {
+                    egui::vec2(16.0, 16.0) * effective_zoom
+                };
+                let part_rect = egui::Rect::from_min_size(
+                    egui::pos2(screen_x, screen_y),
+                    part_size,
+                );
+                if part_rect.contains(pos) {
+                    on_part = true;
+                    break;
+                }
+            }
+            if !on_part {
+                state.selected_part_id = None;
+            }
         }
     }
 
-    if response.dragged() && state.selected_part_id.is_some() {
+    if !is_panning && response.dragged() && state.selected_part_id.is_some() {
         let delta = response.drag_delta();
         let zoom = effective_zoom;
         let pixel_aligned = state.pixel_aligned;
@@ -1210,120 +1507,6 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
-    // New Character dialog
-    if state.show_new_character_dialog {
-        egui::Window::new("New Character")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    ui.text_edit_singleline(&mut state.new_character_name);
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() && !state.new_character_name.is_empty() {
-                        if let Some(ref mut project) = state.project {
-                            let character = Character::new(&state.new_character_name);
-                            project.add_character(character);
-                        }
-                        state.show_new_character_dialog = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        state.show_new_character_dialog = false;
-                    }
-                });
-            });
-    }
-
-    // New Part dialog
-    if state.show_new_part_dialog {
-        egui::Window::new("New Part")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                // Character selector
-                let characters: Vec<String> = state.project
-                    .as_ref()
-                    .map(|p| p.characters.iter().map(|c| c.name.clone()).collect())
-                    .unwrap_or_default();
-
-                if let Some(ref mut selected) = state.selected_character_for_part {
-                    ui.horizontal(|ui| {
-                        ui.label("Character:");
-                        egui::ComboBox::from_id_salt("part_char_select")
-                            .selected_text(selected.as_str())
-                            .show_ui(ui, |ui| {
-                                for name in &characters {
-                                    ui.selectable_value(selected, name.clone(), name);
-                                }
-                            });
-                    });
-                } else if let Some(first) = characters.first() {
-                    state.selected_character_for_part = Some(first.clone());
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("Part Name:");
-                    ui.text_edit_singleline(&mut state.new_part_name);
-                });
-
-                ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() && !state.new_part_name.is_empty() {
-                        if let Some(ref char_name) = state.selected_character_for_part {
-                            if let Some(ref mut project) = state.project {
-                                if let Some(character) = project.get_character_mut(char_name) {
-                                    character.add_part(Part::new(&state.new_part_name));
-                                }
-                            }
-                        }
-                        state.show_new_part_dialog = false;
-                        state.selected_character_for_part = None;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        state.show_new_part_dialog = false;
-                        state.selected_character_for_part = None;
-                    }
-                });
-            });
-    }
-
-    // New State dialog
-    if state.show_new_state_dialog {
-        egui::Window::new("New State")
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("State Name:");
-                    ui.text_edit_singleline(&mut state.new_state_name);
-                });
-
-                ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() && !state.new_state_name.is_empty() {
-                        if let (Some(ref char_name), Some(ref part_name)) =
-                            (&state.selected_character_for_part, &state.selected_part_for_state)
-                        {
-                            if let Some(ref mut project) = state.project {
-                                if let Some(character) = project.get_character_mut(char_name) {
-                                    if let Some(part) = character.get_part_mut(part_name) {
-                                        part.add_state(State::new(&state.new_state_name, RotationMode::Deg45));
-                                    }
-                                }
-                            }
-                        }
-                        state.show_new_state_dialog = false;
-                        state.selected_character_for_part = None;
-                        state.selected_part_for_state = None;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        state.show_new_state_dialog = false;
-                        state.selected_character_for_part = None;
-                        state.selected_part_for_state = None;
-                    }
-                });
-            });
-    }
-
     // New Animation dialog
     if state.show_new_animation_dialog {
         egui::Window::new("New Animation")
@@ -1336,11 +1519,16 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() && !state.new_animation_name.is_empty() {
+                        let active_char = state.active_character.clone();
                         if let Some(ref mut project) = state.project {
-                            let animation = Animation::new(&state.new_animation_name);
-                            project.add_animation(animation);
-                            state.current_animation = project.animations.len() - 1;
-                            state.current_frame = 0;
+                            if let Some(ref char_name) = active_char {
+                                if let Some(character) = project.get_character_mut(char_name) {
+                                    let animation = Animation::new(&state.new_animation_name);
+                                    character.add_animation(animation);
+                                    state.current_animation = character.animations.len() - 1;
+                                    state.current_frame = 0;
+                                }
+                            }
                         }
                         state.show_new_animation_dialog = false;
                     }
@@ -1472,6 +1660,177 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                         state.selected_character_for_part = None;
                         state.selected_part_for_state = None;
                         state.selected_state_for_import = None;
+                    }
+                });
+            });
+    }
+
+    // New Character dialog
+    if state.show_new_character_dialog {
+        egui::Window::new("New Character")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut state.new_character_name);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() && !state.new_character_name.is_empty() {
+                        if let Some(ref mut project) = state.project {
+                            let mut character = Character::new(&state.new_character_name);
+                            // Add a default part
+                            character.add_part(Part::new("body"));
+                            project.add_character(character);
+                            state.active_character = Some(state.new_character_name.clone());
+                            state.current_animation = 0;
+                            state.current_frame = 0;
+                            state.set_status(format!("Created character: {}", state.new_character_name));
+                        }
+                        state.show_new_character_dialog = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.show_new_character_dialog = false;
+                    }
+                });
+            });
+    }
+
+    // New Part dialog (for character editor)
+    if state.show_new_part_dialog {
+        egui::Window::new("New Part")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                    ui.label(format!("Adding part to: {}", char_name));
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut state.new_part_name);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() && !state.new_part_name.is_empty() {
+                        if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                            if let Some(ref mut project) = state.project {
+                                if let Some(character) = project.get_character_mut(&char_name) {
+                                    let part = Part::new(&state.new_part_name);
+                                    character.add_part(part);
+                                    state.editor_selected_part = Some(state.new_part_name.clone());
+                                    state.editor_selected_state = None;
+                                    state.set_status(format!("Created part: {}", state.new_part_name));
+                                }
+                            }
+                        }
+                        state.show_new_part_dialog = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.show_new_part_dialog = false;
+                    }
+                });
+            });
+    }
+
+    // New State dialog (for character editor)
+    if state.show_new_state_dialog {
+        egui::Window::new("New State")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if let (ActiveTab::CharacterEditor(ref char_name), Some(ref part_name)) =
+                    (state.active_tab.clone(), state.editor_selected_part.clone())
+                {
+                    ui.label(format!("Adding state to: {} / {}", char_name, part_name));
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut state.new_state_name);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() && !state.new_state_name.is_empty() {
+                        if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                            if let Some(ref part_name) = state.editor_selected_part.clone() {
+                                if let Some(ref mut project) = state.project {
+                                    if let Some(character) = project.get_character_mut(&char_name) {
+                                        if let Some(part) = character.get_part_mut(&part_name) {
+                                            let new_state = State::new(&state.new_state_name, RotationMode::Deg45);
+                                            part.add_state(new_state);
+                                            state.editor_selected_state = Some(state.new_state_name.clone());
+                                            state.set_status(format!("Created state: {}", state.new_state_name));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        state.show_new_state_dialog = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.show_new_state_dialog = false;
+                    }
+                });
+            });
+    }
+
+    // Import Rotation dialog (for character editor rotation wheel)
+    if state.show_import_rotation_dialog {
+        egui::Window::new("Import Rotation Image")
+            .collapsible(false)
+            .resizable(false)
+            .min_width(400.0)
+            .show(ctx, |ui| {
+                if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                    let part_name = state.editor_selected_part.as_deref().unwrap_or("?");
+                    let state_name = state.editor_selected_state.as_deref().unwrap_or("default");
+                    let angle = state.pending_rotation_import.unwrap_or(0);
+                    ui.label(format!("Importing to: {} / {} / {} @ {}°",
+                        char_name, part_name, state_name, angle));
+                }
+                ui.separator();
+
+                ui.label("Enter path to PNG image:");
+                ui.text_edit_singleline(&mut state.import_image_path);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Import").clicked() && !state.import_image_path.is_empty() {
+                        let path = state.import_image_path.clone();
+                        if let Some(angle) = state.pending_rotation_import {
+                            if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                                let part_name = state.editor_selected_part.clone();
+                                let state_name = state.editor_selected_state.clone()
+                                    .or_else(|| Some("default".to_string()));
+
+                                match import_image_as_base64(&path) {
+                                    Ok(base64_data) => {
+                                        if let (Some(ref pn), Some(ref sn)) = (part_name, state_name) {
+                                            if let Some(ref mut project) = state.project {
+                                                if let Some(character) = project.get_character_mut(&char_name) {
+                                                    if let Some(part) = character.get_part_mut(pn) {
+                                                        if let Some(state_obj) = part.states.iter_mut().find(|s| &s.name == sn) {
+                                                            if let Some(rotation) = state_obj.rotations.get_mut(&angle) {
+                                                                rotation.image_data = Some(base64_data);
+                                                                state.set_status(format!("Imported image for {}°", angle));
+                                                                state.texture_cache.clear();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        state.set_status(format!("Import failed: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        state.show_import_rotation_dialog = false;
+                        state.pending_rotation_import = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.show_import_rotation_dialog = false;
+                        state.pending_rotation_import = None;
                     }
                 });
             });

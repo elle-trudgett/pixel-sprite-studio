@@ -138,6 +138,8 @@ impl Part {
 pub struct Character {
     pub name: String,
     pub parts: Vec<Part>,
+    #[serde(default)]
+    pub animations: Vec<Animation>,
 }
 
 impl Character {
@@ -145,6 +147,7 @@ impl Character {
         Self {
             name: name.into(),
             parts: Vec::new(),
+            animations: vec![Animation::new("Animation 1")],
         }
     }
 
@@ -158,6 +161,18 @@ impl Character {
 
     pub fn add_part(&mut self, part: Part) {
         self.parts.push(part);
+    }
+
+    pub fn get_animation(&self, name: &str) -> Option<&Animation> {
+        self.animations.iter().find(|a| a.name == name)
+    }
+
+    pub fn get_animation_mut(&mut self, name: &str) -> Option<&mut Animation> {
+        self.animations.iter_mut().find(|a| a.name == name)
+    }
+
+    pub fn add_animation(&mut self, animation: Animation) {
+        self.animations.push(animation);
     }
 }
 
@@ -273,6 +288,8 @@ pub struct Project {
     pub name: String,
     pub canvas_size: (u32, u32),
     pub characters: Vec<Character>,
+    /// Legacy field for v1 compatibility - animations are now per-character
+    #[serde(default, skip_serializing)]
     pub animations: Vec<Animation>,
     pub reference_layer: ReferenceLayer,
     #[serde(skip)]
@@ -288,11 +305,11 @@ impl Default for Project {
 impl Project {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            version: "1.0".to_string(),
+            version: "2.0".to_string(),
             name: name.into(),
             canvas_size: (64, 64),
             characters: Vec::new(),
-            animations: vec![Animation::new("Animation 1")],
+            animations: Vec::new(), // Empty - animations are per-character now
             reference_layer: ReferenceLayer::new(),
             next_part_id: 1,
         }
@@ -310,18 +327,6 @@ impl Project {
         self.characters.push(character);
     }
 
-    pub fn get_animation(&self, name: &str) -> Option<&Animation> {
-        self.animations.iter().find(|a| a.name == name)
-    }
-
-    pub fn get_animation_mut(&mut self, name: &str) -> Option<&mut Animation> {
-        self.animations.iter_mut().find(|a| a.name == name)
-    }
-
-    pub fn add_animation(&mut self, animation: Animation) {
-        self.animations.push(animation);
-    }
-
     /// Generate a unique ID for placed parts
     pub fn next_id(&mut self) -> u64 {
         let id = self.next_part_id;
@@ -329,45 +334,64 @@ impl Project {
         id
     }
 
-    /// Resolve z-index for a part, checking frame -> animation -> character defaults
-    pub fn resolve_z_index(
-        &self,
-        part_name: &str,
-        character_name: &str,
-        animation_index: usize,
-        frame_index: usize,
-    ) -> i32 {
-        // Check frame-level override
-        if let Some(anim) = self.animations.get(animation_index) {
-            if let Some(frame) = anim.frames.get(frame_index) {
-                if let Some(&z) = frame.z_overrides.get(part_name) {
-                    return z;
-                }
-            }
-            // Check animation-level override
-            if let Some(&z) = anim.z_overrides.get(part_name) {
-                return z;
-            }
-        }
-
-        // Check character default
-        if let Some(character) = self.get_character(character_name) {
-            if let Some(part) = character.get_part(part_name) {
-                return part.default_z;
-            }
-        }
-
-        0 // Default fallback
-    }
-
     /// Save project to JSON string
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 
-    /// Load project from JSON string
+    /// Load project from JSON string, with automatic migration from v1 format
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let mut project: Self = serde_json::from_str(json)?;
+
+        // Migrate v1 projects: move project-level animations to characters
+        if !project.animations.is_empty() {
+            // Build a set of which characters are used by each animation
+            for anim in std::mem::take(&mut project.animations) {
+                // Find which characters are used in this animation
+                let used_chars: std::collections::HashSet<String> = anim.frames.iter()
+                    .flat_map(|f| f.placed_parts.iter())
+                    .map(|p| p.character_name.clone())
+                    .collect();
+
+                if used_chars.len() == 1 {
+                    // Animation uses only one character - assign to that character
+                    let char_name = used_chars.into_iter().next().unwrap();
+                    if let Some(character) = project.characters.iter_mut()
+                        .find(|c| c.name == char_name)
+                    {
+                        character.animations.push(anim);
+                    }
+                } else if !used_chars.is_empty() {
+                    // Animation uses multiple characters - assign to first character
+                    let char_name = used_chars.into_iter().next().unwrap();
+                    if let Some(character) = project.characters.iter_mut()
+                        .find(|c| c.name == char_name)
+                    {
+                        let mut anim = anim;
+                        anim.name = format!("{} (multi-char)", anim.name);
+                        character.animations.push(anim);
+                    }
+                }
+                // If no characters used, animation is orphaned and dropped
+            }
+
+            // Ensure all characters have at least one animation
+            for character in &mut project.characters {
+                if character.animations.is_empty() {
+                    character.animations.push(Animation::new("Animation 1"));
+                }
+            }
+
+            // Update version to indicate migration happened
+            project.version = "2.0".to_string();
+        }
+
+        Ok(project)
+    }
+
+    /// Check if this project was migrated from v1 (had project-level animations)
+    pub fn was_migrated(&self) -> bool {
+        self.version == "2.0" && self.animations.is_empty()
     }
 }
 
@@ -380,7 +404,9 @@ mod tests {
         let project = Project::new("Test Project");
         assert_eq!(project.name, "Test Project");
         assert_eq!(project.canvas_size, (64, 64));
-        assert_eq!(project.animations.len(), 1);
+        assert_eq!(project.version, "2.0");
+        // Animations are now per-character, not project-level
+        assert!(project.animations.is_empty());
     }
 
     #[test]
