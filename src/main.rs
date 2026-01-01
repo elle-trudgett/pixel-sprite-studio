@@ -63,10 +63,13 @@ struct AppState {
     editor_selected_part: Option<String>,
     editor_selected_state: Option<String>,
 
-    // Dragging state
+    // Dragging state (for canvas parts)
     dragging_part: Option<DraggedPart>,
     drag_offset: (f32, f32),
     drag_accumulator: (f32, f32), // Accumulates true position during pixel-aligned drag
+
+    // Drag from gallery state
+    gallery_drag: Option<GalleryDrag>,
 
     // Dialogs
     show_new_character_dialog: bool,
@@ -107,6 +110,13 @@ struct DraggedPart {
     state_name: String,
 }
 
+#[derive(Clone)]
+struct GalleryDrag {
+    character_name: String,
+    part_name: String,
+    state_name: String,
+}
+
 impl AppState {
     fn new() -> Self {
         Self {
@@ -129,6 +139,7 @@ impl AppState {
             dragging_part: None,
             drag_offset: (0.0, 0.0),
             drag_accumulator: (0.0, 0.0),
+            gallery_drag: None,
             show_new_character_dialog: false,
             show_new_part_dialog: false,
             show_new_state_dialog: false,
@@ -559,6 +570,117 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                             state.show_new_animation_dialog = true;
                             state.new_animation_name.clear();
                         }
+
+                        // Parts Gallery
+                        ui.add_space(10.0);
+                        ui.heading("Parts Gallery");
+                        ui.label("(Drag to canvas)");
+                        ui.separator();
+
+                        // Show parts with thumbnails in a grid
+                        let gallery_parts: Vec<(String, String, Option<String>)> = character.parts.iter()
+                            .map(|p| {
+                                // Get the 0° rotation of the first state for thumbnail
+                                let thumb_data = p.states.first()
+                                    .and_then(|s| s.rotations.get(&0))
+                                    .and_then(|r| r.image_data.clone());
+                                (p.name.clone(), p.states.first().map(|s| s.name.clone()).unwrap_or_else(|| "default".to_string()), thumb_data)
+                            })
+                            .collect();
+
+                        let char_name_for_gallery = active_char_name.clone();
+                        let gallery_size = 48.0;
+                        let items_per_row = ((ui.available_width() - 20.0) / (gallery_size + 8.0)).max(1.0) as usize;
+
+                        egui::Grid::new("parts_gallery_grid")
+                            .spacing([4.0, 4.0])
+                            .show(ui, |ui| {
+                                for (idx, (part_name, state_name, thumb_data)) in gallery_parts.iter().enumerate() {
+                                    let texture_key = format!("gallery/{}/{}", char_name_for_gallery, part_name);
+
+                                    // Load thumbnail texture if needed
+                                    if let Some(ref data) = thumb_data {
+                                        if !state.texture_cache.contains_key(&texture_key) {
+                                            if let Ok(tex) = decode_base64_to_texture(ui.ctx(), &texture_key, data) {
+                                                state.texture_cache.insert(texture_key.clone(), tex);
+                                            }
+                                        }
+                                    }
+
+                                    // Draw gallery item
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(gallery_size, gallery_size + 14.0),
+                                        egui::Sense::drag(),
+                                    );
+
+                                    let image_rect = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(gallery_size, gallery_size),
+                                    );
+
+                                    // Background
+                                    let bg_color = if response.dragged() || response.hovered() {
+                                        egui::Color32::from_rgb(80, 80, 100)
+                                    } else {
+                                        egui::Color32::from_rgb(50, 50, 60)
+                                    };
+                                    ui.painter().rect_filled(image_rect, 4.0, bg_color);
+
+                                    // Draw thumbnail or placeholder
+                                    if let Some(texture) = state.texture_cache.get(&texture_key) {
+                                        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                                        ui.painter().image(texture.id(), image_rect.shrink(2.0), uv, egui::Color32::WHITE);
+                                    } else {
+                                        // Placeholder with part name
+                                        ui.painter().text(
+                                            image_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            &part_name.chars().take(3).collect::<String>(),
+                                            egui::FontId::proportional(12.0),
+                                            egui::Color32::GRAY,
+                                        );
+                                    }
+
+                                    // Border
+                                    ui.painter().rect_stroke(
+                                        image_rect,
+                                        4.0,
+                                        egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 100, 120)),
+                                    );
+
+                                    // Part name below
+                                    let label_rect = egui::Rect::from_min_size(
+                                        egui::pos2(rect.min.x, rect.min.y + gallery_size + 1.0),
+                                        egui::vec2(gallery_size, 12.0),
+                                    );
+                                    let truncated_name: String = if part_name.len() > 6 {
+                                        format!("{}...", &part_name[..5])
+                                    } else {
+                                        part_name.clone()
+                                    };
+                                    ui.painter().text(
+                                        label_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        truncated_name,
+                                        egui::FontId::proportional(9.0),
+                                        egui::Color32::WHITE,
+                                    );
+
+                                    // Handle drag start
+                                    if response.drag_started() {
+                                        state.gallery_drag = Some(GalleryDrag {
+                                            character_name: char_name_for_gallery.clone(),
+                                            part_name: part_name.clone(),
+                                            state_name: state_name.clone(),
+                                        });
+                                    }
+
+                                    // End row after items_per_row
+                                    if (idx + 1) % items_per_row == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
                     }
                 } else {
                     ui.label("");
@@ -1445,6 +1567,38 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         state.canvas_offset.1 += delta.y;
     }
 
+    // Handle gallery drag drop onto canvas
+    let mouse_released = ui.input(|i| i.pointer.any_released());
+    if mouse_released && state.gallery_drag.is_some() {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            // Check if dropped within canvas bounds
+            if canvas_rect.contains(pos) {
+                // Convert screen position to canvas coordinates
+                let canvas_x = (pos.x - canvas_rect.min.x) / effective_zoom;
+                let canvas_y = (pos.y - canvas_rect.min.y) / effective_zoom;
+
+                // Place the part
+                if let Some(gallery_drag) = state.gallery_drag.take() {
+                    let pixel_aligned = state.pixel_aligned;
+                    let (x, y) = if pixel_aligned {
+                        (canvas_x.round(), canvas_y.round())
+                    } else {
+                        (canvas_x, canvas_y)
+                    };
+                    state.place_part_on_canvas(
+                        &gallery_drag.character_name,
+                        &gallery_drag.part_name,
+                        &gallery_drag.state_name,
+                        x,
+                        y,
+                    );
+                    state.set_status(format!("Placed {} at ({:.0}, {:.0})", gallery_drag.part_name, x, y));
+                }
+            }
+        }
+        state.gallery_drag = None;
+    }
+
     // Handle mouse interactions - select on mouse down (drag_started) for immediate feedback
     // Skip if we're panning
     if !is_panning && response.drag_started() {
@@ -1556,6 +1710,52 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             canvas_size.0, canvas_size.1, state.zoom_level, parts_count
         )),
     );
+
+    // Draw drag indicator when dragging from gallery
+    if let Some(ref gallery_drag) = state.gallery_drag {
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            let drag_size = 48.0;
+            let drag_rect = egui::Rect::from_center_size(
+                pos,
+                egui::vec2(drag_size, drag_size),
+            );
+
+            // Draw semi-transparent background
+            painter.rect_filled(drag_rect, 4.0, egui::Color32::from_rgba_unmultiplied(60, 60, 80, 200));
+
+            // Try to draw the thumbnail
+            let texture_key = format!("gallery/{}/{}", gallery_drag.character_name, gallery_drag.part_name);
+            if let Some(texture) = state.texture_cache.get(&texture_key) {
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(texture.id(), drag_rect.shrink(2.0), uv, egui::Color32::WHITE);
+            } else {
+                // Fallback: show part name
+                painter.text(
+                    drag_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &gallery_drag.part_name,
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::WHITE,
+                );
+            }
+
+            painter.rect_stroke(drag_rect, 4.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+
+            // Show "drop here" indicator if over canvas
+            if canvas_rect.contains(pos) {
+                let canvas_x = (pos.x - canvas_rect.min.x) / effective_zoom;
+                let canvas_y = (pos.y - canvas_rect.min.y) / effective_zoom;
+                let label = format!("({:.0}, {:.0})", canvas_x, canvas_y);
+                painter.text(
+                    pos + egui::vec2(drag_size / 2.0 + 5.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::YELLOW,
+                );
+            }
+        }
+    }
 }
 
 fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
