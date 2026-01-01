@@ -1067,20 +1067,20 @@ fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_name: &
 }
 
 /// Renders a circular rotation wheel for importing/viewing rotation sprites
-fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, _char_name: &str, rotations: &[(u16, bool)]) {
+fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, char_name: &str, rotations: &[(u16, bool)]) {
     // Push a unique ID scope for this wheel instance
     let part_name = state.editor_selected_part.as_deref().unwrap_or("none");
     let state_name = state.editor_selected_state.as_deref().unwrap_or("default");
     ui.push_id(format!("rot_wheel_{}_{}", part_name, state_name), |ui| {
     let available = ui.available_size();
-    let center_x = available.x.min(400.0) / 2.0;
-    let center_y = 200.0; // Fixed height for the wheel area
-    let radius = 80.0;
-    let slot_size = 48.0;
+    let wheel_size = available.x.min(500.0);
+    let center_y = 250.0; // Fixed height for the wheel area
+    let radius = 120.0;  // Increased radius
+    let slot_size = 64.0; // Larger slots for sprites
 
     // Reserve space for the wheel
     let (response, painter) = ui.allocate_painter(
-        egui::vec2(available.x.min(400.0), center_y * 2.0),
+        egui::vec2(wheel_size, center_y * 2.0),
         egui::Sense::hover(),
     );
 
@@ -1116,11 +1116,43 @@ fn render_rotation_wheel(ui: &mut egui::Ui, state: &mut AppState, _char_name: &s
 
         // Draw slot background
         let bg_color = if has_image {
-            egui::Color32::from_rgb(60, 120, 60) // Green for has image
+            egui::Color32::from_rgb(40, 40, 40) // Dark bg for images
         } else {
-            egui::Color32::from_rgb(80, 80, 80) // Gray for empty
+            egui::Color32::from_rgb(60, 60, 60) // Gray for empty
         };
         painter.rect_filled(slot_rect, 4.0, bg_color);
+
+        // Try to draw the sprite image if it exists
+        if has_image {
+            let texture_key = format!("{}/{}/{}/{}", char_name, part_name, state_name, angle);
+
+            // Get or create texture
+            if !state.texture_cache.contains_key(&texture_key) {
+                // Try to load the image data
+                if let Some(ref project) = state.project {
+                    if let Some(character) = project.get_character(char_name) {
+                        if let Some(part) = character.get_part(part_name) {
+                            if let Some(state_obj) = part.states.iter().find(|s| s.name == state_name) {
+                                if let Some(rotation) = state_obj.rotations.get(angle) {
+                                    if let Some(ref base64_data) = rotation.image_data {
+                                        if let Ok(texture) = decode_base64_to_texture(ui.ctx(), &texture_key, base64_data) {
+                                            state.texture_cache.insert(texture_key.clone(), texture);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Draw the texture if we have it
+            if let Some(texture) = state.texture_cache.get(&texture_key) {
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                painter.image(texture.id(), slot_rect.shrink(2.0), uv, egui::Color32::WHITE);
+            }
+        }
+
         painter.rect_stroke(slot_rect, 4.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
 
         // Draw angle label below the slot
@@ -1830,10 +1862,25 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
 }
 
 fn import_image_as_base64(path: &str) -> Result<String, String> {
+    const MAX_TEXTURE_SIZE: u32 = 2048;
+
     let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
-    // Verify it's a valid PNG
+    // Verify it's a valid image
     let img = image::load_from_memory(&bytes).map_err(|e| format!("Invalid image: {}", e))?;
+
+    // Resize if too large
+    let (width, height) = (img.width(), img.height());
+    let img = if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+        let scale = (MAX_TEXTURE_SIZE as f32 / width as f32)
+            .min(MAX_TEXTURE_SIZE as f32 / height as f32);
+        let new_width = (width as f32 * scale) as u32;
+        let new_height = (height as f32 * scale) as u32;
+        // Note: Image will be resized to fit within 2048x2048
+        img.resize(new_width, new_height, image::imageops::FilterType::Nearest)
+    } else {
+        img
+    };
 
     // Re-encode as PNG to ensure consistent format
     let mut png_bytes = Vec::new();
@@ -1851,6 +1898,8 @@ fn decode_base64_to_texture(
 ) -> Result<egui::TextureHandle, String> {
     use base64::Engine;
 
+    const MAX_TEXTURE_SIZE: u32 = 2048;
+
     // Decode base64
     let png_bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_data)
@@ -1859,6 +1908,19 @@ fn decode_base64_to_texture(
     // Load image
     let img = image::load_from_memory(&png_bytes)
         .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // Check if image needs to be resized
+    let (width, height) = (img.width(), img.height());
+    let img = if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+        // Calculate new size maintaining aspect ratio
+        let scale = (MAX_TEXTURE_SIZE as f32 / width as f32)
+            .min(MAX_TEXTURE_SIZE as f32 / height as f32);
+        let new_width = (width as f32 * scale) as u32;
+        let new_height = (height as f32 * scale) as u32;
+        img.resize(new_width, new_height, image::imageops::FilterType::Nearest)
+    } else {
+        img
+    };
 
     // Convert to RGBA
     let rgba = img.to_rgba8();
