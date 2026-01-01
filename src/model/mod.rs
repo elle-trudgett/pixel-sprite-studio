@@ -242,6 +242,13 @@ pub struct Animation {
     pub frames: Vec<Frame>,
     /// Z-index overrides at the animation level (part_name -> z_index)
     pub z_overrides: HashMap<String, i32>,
+    /// Playback speed in frames per second
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+}
+
+fn default_fps() -> u32 {
+    12
 }
 
 impl Animation {
@@ -250,6 +257,7 @@ impl Animation {
             name: name.into(),
             frames: vec![Frame::new(100)], // Start with one frame
             z_overrides: HashMap::new(),
+            fps: 12,
         }
     }
 

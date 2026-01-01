@@ -175,7 +175,6 @@ struct AppState {
     show_new_part_dialog: bool,
     show_new_state_dialog: bool,
     show_new_animation_dialog: bool,
-    show_save_dialog: bool,
     show_load_dialog: bool,
     show_import_image_dialog: bool,
     show_import_rotation_dialog: bool,
@@ -264,7 +263,6 @@ impl AppState {
             show_new_part_dialog: false,
             show_new_state_dialog: false,
             show_new_animation_dialog: false,
-            show_save_dialog: false,
             show_load_dialog: false,
             show_import_image_dialog: false,
             show_import_rotation_dialog: false,
@@ -611,13 +609,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         let delta = time.delta_secs();
         state.playback_time += delta;
 
-        // Get current frame duration
-        let frame_duration_ms = state.current_animation()
-            .and_then(|anim| anim.frames.get(state.current_frame))
-            .map(|f| f.duration_ms)
-            .unwrap_or(100);
-
-        let frame_duration_secs = frame_duration_ms as f32 / 1000.0;
+        // Calculate frame duration from animation's FPS
+        let fps = state.current_animation().map(|a| a.fps).unwrap_or(12);
+        let frame_duration_secs = 1.0 / fps.max(1) as f32;
 
         // Advance frame if enough time has passed
         if state.playback_time >= frame_duration_secs {
@@ -677,20 +671,12 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     ui.close_menu();
                 }
                 if ui.add_enabled(has_project, egui::Button::new("Save As...")).clicked() {
-                    // Try native file dialog first
                     if let Some(path) = pick_save_file() {
                         let path_str = path.to_string_lossy().to_string();
                         match state.save_project_as(&path_str) {
                             Ok(()) => state.set_status(format!("Saved to {}", path_str)),
                             Err(e) => state.set_status(format!("Save failed: {}", e)),
                         }
-                    } else {
-                        // Fallback to text input dialog
-                        state.show_save_dialog = true;
-                        state.file_path_input = state.project_path
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "project.sprite-animator.json".to_string());
                     }
                     ui.close_menu();
                 }
@@ -1380,6 +1366,21 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         state.selected_part_id = None; // Deselect parts during playback
                     }
                 }
+                // Ctrl+S (Cmd+S on Mac) saves the project
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                    if state.project_path.is_some() {
+                        match state.save_project() {
+                            Ok(()) => state.set_status("Project saved"),
+                            Err(e) => state.set_status(format!("Save failed: {}", e)),
+                        }
+                    } else if let Some(path) = pick_save_file() {
+                        let path_str = path.to_string_lossy().to_string();
+                        match state.save_project_as(&path_str) {
+                            Ok(()) => state.set_status(format!("Saved to {}", path_str)),
+                            Err(e) => state.set_status(format!("Save failed: {}", e)),
+                        }
+                    }
+                }
                 // Enter key toggles play/pause
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     state.is_playing = !state.is_playing;
@@ -1392,6 +1393,21 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 if ui.input(|i| i.key_pressed(egui::Key::Delete)) && state.selected_part_id.is_some() {
                     state.delete_selected_part();
                     state.set_status("Part deleted");
+                }
+                // Left/Right arrow keys navigate frames with wrap-around
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && total_frames > 0 {
+                    state.current_frame = if state.current_frame == 0 {
+                        total_frames - 1
+                    } else {
+                        state.current_frame - 1
+                    };
+                    state.playback_time = 0.0;
+                    state.selected_part_id = None;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) && total_frames > 0 {
+                    state.current_frame = (state.current_frame + 1) % total_frames;
+                    state.playback_time = 0.0;
+                    state.selected_part_id = None;
                 }
                 if ui.button("⏹").clicked() {
                     state.is_playing = false;
@@ -1411,6 +1427,15 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                 ui.separator();
                 ui.label(format!("Frame: {} / {}", state.current_frame + 1, total_frames));
+
+                ui.separator();
+                ui.label("FPS:");
+                let mut fps = state.current_animation().map(|a| a.fps).unwrap_or(12);
+                if ui.add(egui::DragValue::new(&mut fps).speed(1).range(1..=60)).changed() {
+                    if let Some(anim) = state.current_animation_mut() {
+                        anim.fps = fps;
+                    }
+                }
             });
 
             ui.separator();
@@ -2837,37 +2862,6 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                     }
                     if ui.button("Cancel").clicked() {
                         state.show_new_animation_dialog = false;
-                    }
-                });
-            });
-    }
-
-    // Save dialog
-    if state.show_save_dialog {
-        egui::Window::new("Save Project")
-            .collapsible(false)
-            .resizable(false)
-            .min_width(400.0)
-            .show(ctx, |ui| {
-                ui.label("Enter file path:");
-                ui.text_edit_singleline(&mut state.file_path_input);
-                ui.label("(Use .sprite-animator.json extension)");
-
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() && !state.file_path_input.is_empty() {
-                        let path = state.file_path_input.clone();
-                        match state.save_project_as(&path) {
-                            Ok(()) => {
-                                state.set_status(format!("Saved to {}", path));
-                            }
-                            Err(e) => {
-                                state.set_status(format!("Save failed: {}", e));
-                            }
-                        }
-                        state.show_save_dialog = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        state.show_save_dialog = false;
                     }
                 });
             });
