@@ -47,13 +47,13 @@ impl AppConfig {
         #[cfg(target_os = "windows")]
         {
             std::env::var("APPDATA").ok().map(|appdata| {
-                PathBuf::from(appdata).join("SpriteAnimator").join("config.json")
+                PathBuf::from(appdata).join("PixelSpriteStudio").join("config.json")
             })
         }
         #[cfg(not(target_os = "windows"))]
         {
             std::env::var("HOME").ok().map(|home| {
-                PathBuf::from(home).join(".config").join("sprite-animator").join("config.json")
+                PathBuf::from(home).join(".config").join("pixel-sprite-studio").join("config.json")
             })
         }
     }
@@ -516,15 +516,15 @@ impl AppState {
 #[cfg(target_os = "windows")]
 fn pick_save_file() -> Option<PathBuf> {
     FileDialog::new()
-        .add_filter("Sprite Animator Project", &["sprite-animator.json", "json"])
-        .set_file_name("project.sprite-animator.json")
+        .add_filter("Pixel Sprite Studio Project", &["pss"])
+        .set_file_name("project.pss")
         .save_file()
 }
 
 #[cfg(target_os = "windows")]
 fn pick_open_file() -> Option<PathBuf> {
     FileDialog::new()
-        .add_filter("Sprite Animator Project", &["sprite-animator.json", "json"])
+        .add_filter("Pixel Sprite Studio Project", &["pss"])
         .pick_file()
 }
 

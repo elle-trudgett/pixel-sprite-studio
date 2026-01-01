@@ -1,8 +1,8 @@
 [package]
-name = "sprite-animator"
+name = "pixel-sprite-studio"
 version = "0.1.0"
 edition = "2021"
-description = "A sprite animation tool with part-based characters and spritesheet export"
+description = "Pixel Sprite Studio - A sprite animation tool with part-based characters and spritesheet export"
 license = "MIT"
 
 [dependencies]

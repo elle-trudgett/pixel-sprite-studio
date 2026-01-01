@@ -3689,6 +3689,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pixel-sprite-studio"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bevy",
+ "bevy_egui",
+ "image",
+ "rfd",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4426,19 +4439,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eda41003dc44290527a59b13432d4a0379379fa074b70174882adfbdfd917844"
 dependencies = [
  "bitflags 2.10.0",
-]
-
-[[package]]
-name = "sprite-animator"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "bevy",
- "bevy_egui",
- "image",
- "rfd",
- "serde",
- "serde_json",
 ]
 
 [[package]]

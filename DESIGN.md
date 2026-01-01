@@ -1,4 +1,4 @@
-# Sprite Animator - Technical Design
+# Pixel Sprite Studio - Technical Design
 
 ## Data Model
 
@@ -94,7 +94,7 @@ The reference layer allows placing a guide image beneath the canvas:
 
 ### File Extension
 
-`.sprite-animator.json`
+`.pss`
 
 ### Schema (v1.0)
 
