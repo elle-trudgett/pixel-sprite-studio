@@ -14,6 +14,11 @@ It might be useful for quick drafting (and then touch up by hand) or creating fi
 - **Spritesheet export** - Export animations as spritesheets with JSON metadata for game engines
 - **Self-contained projects** - All art is embedded in `.pss` project files, no external dependencies
 
+## Download
+Only released for Windows right not but you can build it for Mac or Linux
+
+Releases page: https://github.com/elle-trudgett/pixel-sprite-studio/releases
+
 ## Building
 
 ```bash
