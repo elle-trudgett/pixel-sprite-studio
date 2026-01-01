@@ -1285,23 +1285,44 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     state.active_tab = ActiveTab::Canvas;
                 }
 
-                // Character editor tab (if open)
-                if let ActiveTab::CharacterEditor(ref char_name) = state.active_tab.clone() {
+                // Character editor tab (always present when a character is selected)
+                if let Some(ref char_name) = state.active_character {
                     ui.separator();
-                    let _ = ui.selectable_label(true, format!("Edit: {}", char_name));
-                    if ui.small_button("x").clicked() {
-                        state.active_tab = ActiveTab::Canvas;
+                    let is_editor = matches!(state.active_tab, ActiveTab::CharacterEditor(_));
+                    if ui.selectable_label(is_editor, format!("Edit: {}", char_name)).clicked() {
+                        state.active_tab = ActiveTab::CharacterEditor(char_name.clone());
                     }
                 }
             });
             ui.separator();
 
             // Tab content
-            match &state.active_tab.clone() {
-                ActiveTab::Canvas => render_canvas(ui, &mut state),
-                ActiveTab::CharacterEditor(char_name) => {
-                    let name = char_name.clone();
-                    render_character_editor(ui, &mut state, &name);
+            match &state.active_tab {
+                ActiveTab::Canvas => {
+                    if state.active_character.is_some() {
+                        render_canvas(ui, &mut state);
+                    } else {
+                        // No character selected - show helpful message
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(ui.available_height() / 3.0);
+                                ui.label(
+                                    egui::RichText::new("Select or create a character in the left panel.")
+                                        .size(16.0)
+                                        .color(egui::Color32::GRAY)
+                                );
+                            });
+                        });
+                    }
+                }
+                ActiveTab::CharacterEditor(_) => {
+                    // Always use the currently selected character
+                    if let Some(char_name) = state.active_character.clone() {
+                        render_character_editor(ui, &mut state, &char_name);
+                    } else {
+                        // Fallback to canvas if no character selected
+                        state.active_tab = ActiveTab::Canvas;
+                    }
                 }
             }
         }
@@ -2270,6 +2291,8 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                             state.active_character = Some(state.new_character_name.clone());
                             state.current_animation = 0;
                             state.current_frame = 0;
+                            // Open the character editor for the new character
+                            state.active_tab = ActiveTab::CharacterEditor(state.new_character_name.clone());
                             state.set_status(format!("Created character: {}", state.new_character_name));
                         }
                         state.show_new_character_dialog = false;
