@@ -105,7 +105,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Sprite Animator".into(),
+                title: "Pixel Sprite Studio".into(),
                 resolution: (1920., 1080.).into(),
                 resizable: true,
                 ..default()
@@ -175,7 +175,6 @@ struct AppState {
     show_new_part_dialog: bool,
     show_new_state_dialog: bool,
     show_new_animation_dialog: bool,
-    show_load_dialog: bool,
     show_import_image_dialog: bool,
     show_import_rotation_dialog: bool,
     show_rename_dialog: bool,
@@ -197,7 +196,6 @@ struct AppState {
     selected_part_for_state: Option<String>,
     selected_state_for_import: Option<String>,
     selected_rotation_for_import: u16,
-    file_path_input: String,
     import_image_path: String,
 
     // Status message
@@ -263,7 +261,6 @@ impl AppState {
             show_new_part_dialog: false,
             show_new_state_dialog: false,
             show_new_animation_dialog: false,
-            show_load_dialog: false,
             show_import_image_dialog: false,
             show_import_rotation_dialog: false,
             show_rename_dialog: false,
@@ -279,7 +276,6 @@ impl AppState {
             selected_part_for_state: None,
             selected_state_for_import: None,
             selected_rotation_for_import: 0,
-            file_path_input: String::new(),
             import_image_path: String::new(),
             status_message: None,
             texture_cache: HashMap::new(),
@@ -642,18 +638,11 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 if ui.button("Open...").clicked() {
                     if state.has_unsaved_changes() {
                         state.pending_action = Some(PendingAction::OpenProject);
-                    } else {
-                        // Try native file dialog first
-                        if let Some(path) = pick_open_file() {
-                            let path_str = path.to_string_lossy().to_string();
-                            match state.load_project(&path_str) {
-                                Ok(()) => state.set_status(format!("Loaded {}", path_str)),
-                                Err(e) => state.set_status(format!("Load failed: {}", e)),
-                            }
-                        } else {
-                            // Fallback to text input dialog
-                            state.show_load_dialog = true;
-                            state.file_path_input.clear();
+                    } else if let Some(path) = pick_open_file() {
+                        let path_str = path.to_string_lossy().to_string();
+                        match state.load_project(&path_str) {
+                            Ok(()) => state.set_status(format!("Loaded {}", path_str)),
+                            Err(e) => state.set_status(format!("Load failed: {}", e)),
                         }
                     }
                     ui.close_menu();
@@ -1521,7 +1510,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         if state.project.is_none() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.heading("Welcome to Sprite Animator");
+                ui.heading("Welcome to Pixel Sprite Studio");
                 ui.add_space(10.0);
                 ui.label("Create or open a project to begin.");
                 ui.add_space(20.0);
@@ -1539,9 +1528,6 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             Ok(()) => state.set_status(format!("Loaded {}", path_str)),
                             Err(e) => state.set_status(format!("Load failed: {}", e)),
                         }
-                    } else {
-                        state.show_load_dialog = true;
-                        state.file_path_input.clear();
                     }
                 }
 
@@ -2862,36 +2848,6 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                     }
                     if ui.button("Cancel").clicked() {
                         state.show_new_animation_dialog = false;
-                    }
-                });
-            });
-    }
-
-    // Load dialog
-    if state.show_load_dialog {
-        egui::Window::new("Open Project")
-            .collapsible(false)
-            .resizable(false)
-            .min_width(400.0)
-            .show(ctx, |ui| {
-                ui.label("Enter file path:");
-                ui.text_edit_singleline(&mut state.file_path_input);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Open").clicked() && !state.file_path_input.is_empty() {
-                        let path = state.file_path_input.clone();
-                        match state.load_project(&path) {
-                            Ok(()) => {
-                                state.set_status(format!("Loaded {}", path));
-                            }
-                            Err(e) => {
-                                state.set_status(format!("Load failed: {}", e));
-                            }
-                        }
-                        state.show_load_dialog = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        state.show_load_dialog = false;
                     }
                 });
             });
