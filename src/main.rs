@@ -1377,6 +1377,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     state.is_playing = !state.is_playing;
                     if state.is_playing {
                         state.playback_time = 0.0; // Reset timer when starting
+                        state.selected_part_id = None; // Deselect parts during playback
                     }
                 }
                 // Enter key toggles play/pause
@@ -1384,6 +1385,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     state.is_playing = !state.is_playing;
                     if state.is_playing {
                         state.playback_time = 0.0;
+                        state.selected_part_id = None; // Deselect parts during playback
                     }
                 }
                 // Delete key deletes selected part
