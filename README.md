@@ -1,6 +1,8 @@
 # Pixel Sprite Studio
 
-A sprite animation tool built with Rust and Bevy for creating part-based character animations.
+Pixel Sprite Studio is an animation tool for pixel art characters. It lets you organize all your character art in a single project and composite animations from individual pieces—useful for quick drafting or creating final, ready-to-use animations.
+
+This is not a graphics editor. You import your own art and use Pixel Sprite Studio to assemble and animate it, then export to spritesheets.
 
 ## Features
 
