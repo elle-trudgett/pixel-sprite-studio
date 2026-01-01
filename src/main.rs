@@ -103,6 +103,8 @@ struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
     config: AppConfig,
+    last_saved_json: Option<String>, // JSON of last saved state for dirty checking
+    last_saved_time: Option<std::time::Instant>, // When we last saved
 
     // UI state
     show_grid: bool,
@@ -111,6 +113,7 @@ struct AppState {
     current_animation: usize,
     current_frame: usize,
     is_playing: bool,
+    playback_time: f32, // Accumulated time in current frame (seconds)
     selected_part_id: Option<u64>,
     pixel_aligned: bool,
     canvas_offset: (f32, f32), // Pan offset for canvas
@@ -141,6 +144,7 @@ struct AppState {
     show_load_dialog: bool,
     show_import_image_dialog: bool,
     show_import_rotation_dialog: bool,
+    show_close_project_dialog: bool,
 
     // Rotation import state (from character editor)
     pending_rotation_import: Option<u16>,
@@ -184,12 +188,15 @@ impl AppState {
             project: None,
             project_path: None,
             config: AppConfig::load(),
+            last_saved_json: None,
+            last_saved_time: None,
             show_grid: true,
             show_labels: true,
             zoom_level: 16.0,
             current_animation: 0,
             current_frame: 0,
             is_playing: false,
+            playback_time: 0.0,
             selected_part_id: None,
             pixel_aligned: true,
             canvas_offset: (0.0, 0.0),
@@ -210,6 +217,7 @@ impl AppState {
             show_load_dialog: false,
             show_import_image_dialog: false,
             show_import_rotation_dialog: false,
+            show_close_project_dialog: false,
             pending_rotation_import: None,
             new_character_name: String::new(),
             new_part_name: String::new(),
@@ -287,6 +295,10 @@ impl AppState {
         let json = project.to_json().map_err(|e| format!("Serialize error: {}", e))?;
         fs::write(path, &json).map_err(|e| format!("Write error: {}", e))?;
 
+        // Track saved state for dirty checking
+        self.last_saved_json = Some(json);
+        self.last_saved_time = Some(std::time::Instant::now());
+
         Ok(())
     }
 
@@ -303,22 +315,58 @@ impl AppState {
         let json = fs::read_to_string(path).map_err(|e| format!("Read error: {}", e))?;
         let project = Project::from_json(&json).map_err(|e| format!("Parse error: {}", e))?;
 
+        // Track saved state
+        self.last_saved_json = project.to_json().ok();
+        self.last_saved_time = Some(std::time::Instant::now());
+
         self.project = Some(project);
         self.project_path = Some(PathBuf::from(path));
         self.current_animation = 0;
         self.current_frame = 0;
         self.selected_part_id = None;
+        self.active_character = None;
         self.config.add_recent(path);
 
         Ok(())
     }
 
     fn new_project(&mut self) {
-        self.project = Some(Project::new("Untitled"));
+        let project = Project::new("Untitled");
+        self.last_saved_json = project.to_json().ok();
+        self.last_saved_time = None; // New project hasn't been saved yet
+        self.project = Some(project);
         self.project_path = None;
         self.current_animation = 0;
         self.current_frame = 0;
         self.selected_part_id = None;
+        self.active_character = None;
+    }
+
+    fn close_project(&mut self) {
+        self.project = None;
+        self.project_path = None;
+        self.last_saved_json = None;
+        self.last_saved_time = None;
+        self.current_animation = 0;
+        self.current_frame = 0;
+        self.selected_part_id = None;
+        self.active_character = None;
+        self.active_tab = ActiveTab::Canvas;
+        self.texture_cache.clear();
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        match (&self.project, &self.last_saved_json) {
+            (Some(project), Some(saved_json)) => {
+                project.to_json().ok().as_ref() != Some(saved_json)
+            }
+            (Some(_), None) => true, // Project exists but never saved
+            _ => false,
+        }
+    }
+
+    fn time_since_save(&self) -> Option<std::time::Duration> {
+        self.last_saved_time.map(|t| t.elapsed())
     }
 
     fn active_character_ref(&self) -> Option<&Character> {
@@ -402,8 +450,31 @@ fn setup(mut commands: Commands, mut state: ResMut<AppState>) {
     *state = AppState::new();
 }
 
-fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
+fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<Time>) {
     let ctx = contexts.ctx_mut();
+
+    // Handle animation playback
+    if state.is_playing {
+        let delta = time.delta_secs();
+        state.playback_time += delta;
+
+        // Get current frame duration
+        let frame_duration_ms = state.current_animation()
+            .and_then(|anim| anim.frames.get(state.current_frame))
+            .map(|f| f.duration_ms)
+            .unwrap_or(100);
+
+        let frame_duration_secs = frame_duration_ms as f32 / 1000.0;
+
+        // Advance frame if enough time has passed
+        if state.playback_time >= frame_duration_secs {
+            state.playback_time -= frame_duration_secs;
+            let total = state.total_frames();
+            if total > 0 {
+                state.current_frame = (state.current_frame + 1) % total;
+            }
+        }
+    }
 
     // Dialogs (rendered first so they appear on top)
     render_dialogs(ctx, &mut state);
@@ -459,6 +530,16 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                             .as_ref()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|| "project.sprite-animator.json".to_string());
+                    }
+                    ui.close_menu();
+                }
+                // Close Project
+                if ui.add_enabled(has_project, egui::Button::new("Close Project")).clicked() {
+                    if state.has_unsaved_changes() {
+                        state.show_close_project_dialog = true;
+                    } else {
+                        state.close_project();
+                        state.set_status("Project closed");
                     }
                     ui.close_menu();
                 }
@@ -1025,16 +1106,22 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
                 let play_text = if state.is_playing { "⏸" } else { "▶" };
                 if ui.button(play_text).clicked() {
                     state.is_playing = !state.is_playing;
+                    if state.is_playing {
+                        state.playback_time = 0.0; // Reset timer when starting
+                    }
                 }
                 if ui.button("⏹").clicked() {
                     state.is_playing = false;
                     state.current_frame = 0;
+                    state.playback_time = 0.0;
                 }
                 if ui.button("⏮").clicked() && state.current_frame > 0 {
                     state.current_frame -= 1;
+                    state.playback_time = 0.0;
                 }
                 if ui.button("⏭").clicked() && state.current_frame < total_frames - 1 {
                     state.current_frame += 1;
+                    state.playback_time = 0.0;
                 }
 
                 ui.separator();
@@ -1904,6 +1991,75 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
+    // Close Project confirmation dialog
+    if state.show_close_project_dialog {
+        egui::Window::new("Close Project?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("You have unsaved changes.");
+
+                // Show time since last save
+                if let Some(duration) = state.time_since_save() {
+                    let minutes = duration.as_secs() / 60;
+                    if minutes > 0 {
+                        ui.label(format!("Last saved {} minute{} ago.", minutes, if minutes == 1 { "" } else { "s" }));
+                    } else {
+                        ui.label("Last saved less than a minute ago.");
+                    }
+                } else {
+                    ui.label("This project has never been saved.");
+                }
+
+                ui.add_space(10.0);
+                ui.label("Do you want to save before closing?");
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save & Close").clicked() {
+                        // Try to save first
+                        if state.project_path.is_some() {
+                            match state.save_project() {
+                                Ok(()) => {
+                                    state.close_project();
+                                    state.set_status("Project saved and closed");
+                                }
+                                Err(e) => {
+                                    state.set_status(format!("Save failed: {}", e));
+                                }
+                            }
+                        } else {
+                            // Need to Save As first
+                            if let Some(path) = pick_save_file() {
+                                let path_str = path.to_string_lossy().to_string();
+                                match state.save_project_as(&path_str) {
+                                    Ok(()) => {
+                                        state.close_project();
+                                        state.set_status("Project saved and closed");
+                                    }
+                                    Err(e) => {
+                                        state.set_status(format!("Save failed: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        state.show_close_project_dialog = false;
+                    }
+
+                    if ui.button("Close Without Saving").clicked() {
+                        state.close_project();
+                        state.set_status("Project closed without saving");
+                        state.show_close_project_dialog = false;
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        state.show_close_project_dialog = false;
+                    }
+                });
+            });
+    }
+
     // New Animation dialog
     if state.show_new_animation_dialog {
         egui::Window::new("New Animation")
