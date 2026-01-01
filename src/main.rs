@@ -683,12 +683,20 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             });
         });
 
-        // Status message in menu bar
-        if let Some((ref msg, _)) = state.status_message {
-            ui.separator();
-            ui.label(msg);
-        }
     });
+
+    // Status bar (bottom-most panel, before timeline)
+    egui::TopBottomPanel::bottom("status_bar")
+        .max_height(24.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some((ref msg, _)) = state.status_message {
+                    ui.label(msg);
+                } else {
+                    ui.label("Ready");
+                }
+            });
+        });
 
     // Asset browser (left panel) - Simplified: flat character list + animations
     egui::SidePanel::left("asset_browser")
@@ -1184,9 +1192,6 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     }
                 });
             });
-
-            ui.separator();
-            ui.label("  Tracks: (drag parts here to animate)");
         });
 
     // Central canvas area with tabs
