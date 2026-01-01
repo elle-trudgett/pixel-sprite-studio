@@ -6,11 +6,71 @@ use model::{Animation, Character, Part, Project, State, RotationMode, PlacedPart
 use std::path::PathBuf;
 use std::fs;
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
+const MAX_RECENT_PROJECTS: usize = 10;
 
 #[cfg(target_os = "windows")]
 use rfd::FileDialog;
 
 const ZOOM_LEVELS: [f32; 10] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+/// App configuration stored on disk
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AppConfig {
+    recent_projects: Vec<String>,
+}
+
+impl AppConfig {
+    fn config_path() -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var("APPDATA").ok().map(|appdata| {
+                PathBuf::from(appdata).join("SpriteAnimator").join("config.json")
+            })
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::env::var("HOME").ok().map(|home| {
+                PathBuf::from(home).join(".config").join("sprite-animator").join("config.json")
+            })
+        }
+    }
+
+    fn load() -> Self {
+        Self::config_path()
+            .and_then(|path| fs::read_to_string(&path).ok())
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Some(path) = Self::config_path() {
+            // Create parent directories if needed
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(self) {
+                let _ = fs::write(&path, json);
+            }
+        }
+    }
+
+    fn add_recent(&mut self, path: &str) {
+        // Remove if already exists (to move to front)
+        self.recent_projects.retain(|p| p != path);
+        // Add to front
+        self.recent_projects.insert(0, path.to_string());
+        // Trim to max size
+        self.recent_projects.truncate(MAX_RECENT_PROJECTS);
+        self.save();
+    }
+
+    fn remove_recent(&mut self, path: &str) {
+        self.recent_projects.retain(|p| p != path);
+        self.save();
+    }
+}
 
 /// Active tab in the central panel
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -42,6 +102,7 @@ fn main() {
 struct AppState {
     project: Option<Project>,
     project_path: Option<PathBuf>,
+    config: AppConfig,
 
     // UI state
     show_grid: bool,
@@ -122,6 +183,7 @@ impl AppState {
         Self {
             project: None,
             project_path: None,
+            config: AppConfig::load(),
             show_grid: true,
             show_labels: true,
             zoom_level: 16.0,
@@ -230,7 +292,11 @@ impl AppState {
 
     fn save_project_as(&mut self, path: &str) -> Result<(), String> {
         self.project_path = Some(PathBuf::from(path));
-        self.save_project()
+        let result = self.save_project();
+        if result.is_ok() {
+            self.config.add_recent(path);
+        }
+        result
     }
 
     fn load_project(&mut self, path: &str) -> Result<(), String> {
@@ -242,6 +308,7 @@ impl AppState {
         self.current_animation = 0;
         self.current_frame = 0;
         self.selected_part_id = None;
+        self.config.add_recent(path);
 
         Ok(())
     }
@@ -1011,16 +1078,84 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>) {
     // Central canvas area with tabs
     egui::CentralPanel::default().show(ctx, |ui| {
         if state.project.is_none() {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading("Welcome to Sprite Animator");
-                    ui.label("");
-                    ui.label("Create or open a project to begin.");
-                    ui.label("");
-                    if ui.button("New Project").clicked() {
-                        state.new_project();
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.heading("Welcome to Sprite Animator");
+                ui.add_space(10.0);
+                ui.label("Create or open a project to begin.");
+                ui.add_space(20.0);
+
+                if ui.button("New Project").clicked() {
+                    state.new_project();
+                }
+
+                ui.add_space(10.0);
+
+                if ui.button("Open Project...").clicked() {
+                    if let Some(path) = pick_open_file() {
+                        let path_str = path.to_string_lossy().to_string();
+                        match state.load_project(&path_str) {
+                            Ok(()) => state.set_status(format!("Loaded {}", path_str)),
+                            Err(e) => state.set_status(format!("Load failed: {}", e)),
+                        }
+                    } else {
+                        state.show_load_dialog = true;
+                        state.file_path_input.clear();
                     }
-                });
+                }
+
+                // Recent Projects
+                let recent = state.config.recent_projects.clone();
+                if !recent.is_empty() {
+                    ui.add_space(30.0);
+                    ui.heading("Recent Projects");
+                    ui.add_space(10.0);
+
+                    let mut project_to_open: Option<String> = None;
+                    let mut project_to_remove: Option<String> = None;
+
+                    for path in &recent {
+                        ui.horizontal(|ui| {
+                            // Extract just the filename for display
+                            let display_name = PathBuf::from(path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.clone());
+
+                            if ui.button(&display_name).clicked() {
+                                project_to_open = Some(path.clone());
+                            }
+
+                            // Show full path as tooltip
+                            if ui.small_button("×").on_hover_text("Remove from recent").clicked() {
+                                project_to_remove = Some(path.clone());
+                            }
+
+                            ui.label(
+                                egui::RichText::new(path)
+                                    .small()
+                                    .color(egui::Color32::GRAY)
+                            );
+                        });
+                    }
+
+                    // Handle actions after UI loop
+                    if let Some(path) = project_to_open {
+                        match state.load_project(&path) {
+                            Ok(()) => state.set_status(format!("Loaded {}", path)),
+                            Err(e) => {
+                                state.set_status(format!("Load failed: {}", e));
+                                // Remove from recent if file doesn't exist
+                                if e.contains("Read error") {
+                                    state.config.remove_recent(&path);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(path) = project_to_remove {
+                        state.config.remove_recent(&path);
+                    }
+                }
             });
         } else {
             // Tab bar
@@ -1577,13 +1712,23 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 let canvas_x = (pos.x - canvas_rect.min.x) / effective_zoom;
                 let canvas_y = (pos.y - canvas_rect.min.y) / effective_zoom;
 
-                // Place the part
+                // Place the part (centered on drop position)
                 if let Some(gallery_drag) = state.gallery_drag.take() {
+                    // Get sprite size to center it
+                    let texture_key = format!("gallery/{}/{}", gallery_drag.character_name, gallery_drag.part_name);
+                    let sprite_size = state.texture_cache.get(&texture_key)
+                        .map(|t| t.size_vec2())
+                        .unwrap_or(egui::vec2(16.0, 16.0));
+
+                    // Offset by half sprite size to center on cursor
+                    let centered_x = canvas_x - sprite_size.x / 2.0;
+                    let centered_y = canvas_y - sprite_size.y / 2.0;
+
                     let pixel_aligned = state.pixel_aligned;
                     let (x, y) = if pixel_aligned {
-                        (canvas_x.round(), canvas_y.round())
+                        (centered_x.round(), centered_y.round())
                     } else {
-                        (canvas_x, canvas_y)
+                        (centered_x, centered_y)
                     };
                     state.place_part_on_canvas(
                         &gallery_drag.character_name,
