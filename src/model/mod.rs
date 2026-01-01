@@ -147,7 +147,7 @@ impl Character {
         Self {
             name: name.into(),
             parts: Vec::new(),
-            animations: vec![Animation::new("Animation 1")],
+            animations: vec![Animation::new("Untitled Animation")],
         }
     }
 
@@ -182,6 +182,8 @@ pub struct PlacedPart {
     pub id: u64, // Unique ID for this placement
     pub character_name: String,
     pub part_name: String,
+    #[serde(default)]
+    pub layer_name: String, // Display name for the layer (may differ from part_name)
     pub state_name: String,
     pub rotation: u16,       // Current rotation angle
     pub position: (f32, f32), // (x, y) position on canvas
@@ -195,15 +197,22 @@ impl PlacedPart {
         part_name: impl Into<String>,
         state_name: impl Into<String>,
     ) -> Self {
+        let part_name = part_name.into();
         Self {
             id,
             character_name: character_name.into(),
-            part_name: part_name.into(),
+            layer_name: part_name.clone(), // Default layer name is the part name
+            part_name,
             state_name: state_name.into(),
             rotation: 0,
             position: (0.0, 0.0),
             z_override: None,
         }
+    }
+
+    pub fn with_layer_name(mut self, layer_name: impl Into<String>) -> Self {
+        self.layer_name = layer_name.into();
+        self
     }
 }
 
@@ -343,6 +352,16 @@ impl Project {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         let mut project: Self = serde_json::from_str(json)?;
 
+        // Initialize next_part_id to be higher than any existing part ID
+        let max_id = project.characters.iter()
+            .flat_map(|c| c.animations.iter())
+            .flat_map(|a| a.frames.iter())
+            .flat_map(|f| f.placed_parts.iter())
+            .map(|p| p.id)
+            .max()
+            .unwrap_or(0);
+        project.next_part_id = max_id + 1;
+
         // Migrate v1 projects: move project-level animations to characters
         if !project.animations.is_empty() {
             // Build a set of which characters are used by each animation
@@ -378,7 +397,7 @@ impl Project {
             // Ensure all characters have at least one animation
             for character in &mut project.characters {
                 if character.animations.is_empty() {
-                    character.animations.push(Animation::new("Animation 1"));
+                    character.animations.push(Animation::new("Untitled Animation"));
                 }
             }
 
