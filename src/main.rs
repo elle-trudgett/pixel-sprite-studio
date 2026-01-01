@@ -1120,26 +1120,12 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Timeline");
-                ui.separator();
 
-                // Animation selector - collect names first to avoid borrow issues
-                let anim_names: Vec<String> = state.project
-                    .as_ref()
-                    .map(|p| p.animations.iter().map(|a| a.name.clone()).collect())
-                    .unwrap_or_default();
-                let current_name = anim_names.get(state.current_animation)
-                    .map(|s| s.as_str())
-                    .unwrap_or("None");
-
-                egui::ComboBox::from_id_salt("anim_select")
-                    .selected_text(current_name)
-                    .show_ui(ui, |ui| {
-                        for (i, name) in anim_names.iter().enumerate() {
-                            if ui.selectable_value(&mut state.current_animation, i, name).clicked() {
-                                state.current_frame = 0;
-                            }
-                        }
-                    });
+                // Show current animation name if one is selected
+                if let Some(anim) = state.current_animation() {
+                    ui.separator();
+                    ui.label(format!("Animation: {}", anim.name));
+                }
 
                 ui.separator();
 
