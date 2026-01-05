@@ -203,6 +203,13 @@ struct AppState {
 
     // Loaded textures cache (texture_id -> egui::TextureHandle)
     texture_cache: HashMap<String, egui::TextureHandle>,
+
+    // Reference image state
+    dragging_reference: bool,
+    reference_drag_start: (f32, f32),
+    reference_initial_pos: (f32, f32),
+    reference_texture_cache: HashMap<String, (egui::TextureHandle, (u32, u32))>, // path -> (texture, original_size)
+    reference_using_fallback: HashMap<String, bool>, // path -> whether using thumbnail fallback
 }
 
 #[derive(Clone)]
@@ -279,6 +286,11 @@ impl AppState {
             import_image_path: String::new(),
             status_message: None,
             texture_cache: HashMap::new(),
+            dragging_reference: false,
+            reference_drag_start: (0.0, 0.0),
+            reference_initial_pos: (0.0, 0.0),
+            reference_texture_cache: HashMap::new(),
+            reference_using_fallback: HashMap::new(),
         }
     }
 
@@ -1310,21 +1322,155 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
             ui.separator();
 
-            // Reference Layer
-            ui.heading("Reference Layer");
-            if let Some(ref mut project) = state.project {
-                ui.checkbox(&mut project.reference_layer.visible, "Visible");
+            // Reference Image (per-frame)
+            ui.heading("Reference Image");
+
+            // Extract needed values before mutable borrow
+            let char_name = state.active_character.clone();
+            let current_anim = state.current_animation;
+            let current_frame_idx = state.current_frame;
+
+            // Get current frame's reference info
+            let current_frame_ref = state.project.as_ref().and_then(|p| {
+                char_name.as_ref().and_then(|cn| {
+                    p.get_character(cn).and_then(|c| {
+                        c.animations.get(current_anim).and_then(|a| {
+                            a.frames.get(current_frame_idx).and_then(|f| {
+                                f.reference.as_ref().map(|r| r.file_path.clone())
+                            })
+                        })
+                    })
+                })
+            });
+
+            // Track what actions to take after UI
+            let mut load_clicked = false;
+            let mut clear_clicked = false;
+
+            ui.horizontal(|ui| {
                 if ui.button("Load Image...").clicked() {
-                    // TODO: Load reference image
+                    load_clicked = true;
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Opacity:");
-                    ui.add(egui::Slider::new(&mut project.reference_layer.opacity, 0.0..=1.0));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Scale:");
-                    ui.add(egui::DragValue::new(&mut project.reference_layer.scale).speed(0.1).range(0.1..=10.0));
-                });
+
+                if current_frame_ref.is_some() {
+                    if ui.button("Clear").clicked() {
+                        clear_clicked = true;
+                    }
+                }
+            });
+
+            // Open file dialog after UI (outside the closure)
+            let load_ref_path = if load_clicked {
+                pick_image_file().map(|p| p.to_string_lossy().to_string())
+            } else {
+                None
+            };
+            let clear_ref = clear_clicked;
+
+            // Handle load action
+            if let Some(path_str) = load_ref_path {
+                if let Some(ref mut project) = state.project {
+                    if !project.reference_thumbnails.contains_key(&path_str) {
+                        if let Ok((thumbnail, _original_size)) = create_reference_thumbnail(&path_str, 256) {
+                            project.reference_thumbnails.insert(path_str.clone(), thumbnail);
+                        }
+                    }
+
+                    // Calculate fit-to-canvas scale
+                    let canvas_size = project.canvas_size;
+                    let scale = if let Ok(bytes) = fs::read(&path_str) {
+                        if let Ok(img) = image::load_from_memory(&bytes) {
+                            calculate_fit_scale((img.width(), img.height()), canvas_size)
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    };
+
+                    // Set reference on current frame
+                    if let Some(ref cn) = char_name {
+                        if let Some(character) = project.get_character_mut(cn) {
+                            if let Some(anim) = character.animations.get_mut(current_anim) {
+                                if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                    frame.reference = Some(model::FrameReference::new(path_str.clone(), scale));
+                                }
+                            }
+                        }
+                    }
+
+                    // Clear texture cache for this path to reload
+                    state.reference_texture_cache.remove(&path_str);
+                    state.set_status(format!("Loaded reference: {}", path_str));
+                }
+            }
+
+            // Handle clear action
+            if clear_ref {
+                if let Some(ref mut project) = state.project {
+                    if let Some(ref cn) = char_name {
+                        if let Some(character) = project.get_character_mut(cn) {
+                            if let Some(anim) = character.animations.get_mut(current_anim) {
+                                if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                    frame.reference = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                state.set_status("Cleared reference image");
+            }
+
+            // Show reference controls if frame has one
+            if let Some(ref mut project) = state.project {
+                if let Some(ref cn) = char_name {
+                    if let Some(character) = project.get_character_mut(cn) {
+                        if let Some(anim) = character.animations.get_mut(current_anim) {
+                            if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                if let Some(ref mut frame_ref) = frame.reference {
+                                    ui.checkbox(&mut frame_ref.show_on_top, "Show on top");
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Opacity:");
+                                        ui.add(egui::Slider::new(&mut frame_ref.opacity, 0.0..=1.0));
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Scale:");
+                                        ui.add(egui::DragValue::new(&mut frame_ref.scale).speed(0.01).range(0.01..=10.0));
+                                    });
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Position:");
+                                        ui.add(egui::DragValue::new(&mut frame_ref.position.0).prefix("X: ").speed(1.0));
+                                        ui.add(egui::DragValue::new(&mut frame_ref.position.1).prefix("Y: ").speed(1.0));
+                                    });
+
+                                    // Show file path (truncated)
+                                    let display_path = if frame_ref.file_path.len() > 30 {
+                                        format!("...{}", &frame_ref.file_path[frame_ref.file_path.len()-27..])
+                                    } else {
+                                        frame_ref.file_path.clone()
+                                    };
+
+                                    // Check if using fallback
+                                    let file_path_clone = frame_ref.file_path.clone();
+                                    let using_fallback = state.reference_using_fallback
+                                        .get(&file_path_clone)
+                                        .copied()
+                                        .unwrap_or(false);
+
+                                    if using_fallback {
+                                        ui.colored_label(egui::Color32::YELLOW, "File missing (using thumbnail)");
+                                    }
+                                    ui.small(&display_path);
+
+                                    ui.small("Shift+MMB/Space to drag");
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -1994,8 +2140,18 @@ struct PlacedPartRenderInfo {
 }
 
 fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
+    // Reference image render info
+    struct ReferenceRenderInfo {
+        file_path: String,
+        position: (f32, f32),
+        scale: f32,
+        opacity: f32,
+        show_on_top: bool,
+        thumbnail: Option<String>,
+    }
+
     // Capture values from project upfront to avoid borrow conflicts
-    let (canvas_size, placed_parts, char_name, anim_name) = {
+    let (canvas_size, placed_parts, char_name, anim_name, reference_info) = {
         let Some(ref project) = state.project else { return };
         let active_char = state.active_character.as_ref();
 
@@ -2005,6 +2161,21 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             .and_then(|c| c.animations.get(state.current_animation))
             .map(|a| a.name.clone())
             .unwrap_or_default();
+
+        // Get reference info for current frame
+        let reference_info: Option<ReferenceRenderInfo> = active_char
+            .and_then(|name| project.get_character(name))
+            .and_then(|c| c.animations.get(state.current_animation))
+            .and_then(|anim| anim.frames.get(state.current_frame))
+            .and_then(|frame| frame.reference.as_ref())
+            .map(|r| ReferenceRenderInfo {
+                file_path: r.file_path.clone(),
+                position: r.position,
+                scale: r.scale,
+                opacity: r.opacity,
+                show_on_top: r.show_on_top,
+                thumbnail: project.reference_thumbnails.get(&r.file_path).cloned(),
+            });
 
         let parts: Vec<PlacedPartRenderInfo> = active_char
             .and_then(|name| project.get_character(name))
@@ -2035,7 +2206,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             })
             .unwrap_or_default();
 
-        (project.canvas_size, parts, char_name, anim_name)
+        (project.canvas_size, parts, char_name, anim_name, reference_info)
     };
 
     let available = ui.available_size();
@@ -2068,6 +2239,55 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Draw canvas background
     painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(40, 40, 50));
+
+    // Helper to render reference image
+    let render_reference = |painter: &egui::Painter, ref_info: &ReferenceRenderInfo,
+                            texture: &egui::TextureHandle, original_size: (u32, u32)| {
+        // Calculate position in screen space
+        let screen_x = canvas_rect.min.x + ref_info.position.0 * effective_zoom;
+        let screen_y = canvas_rect.min.y + ref_info.position.1 * effective_zoom;
+
+        // Calculate displayed size (original size * scale * zoom)
+        let display_w = original_size.0 as f32 * ref_info.scale * effective_zoom;
+        let display_h = original_size.1 as f32 * ref_info.scale * effective_zoom;
+
+        let ref_rect = egui::Rect::from_min_size(
+            egui::pos2(screen_x, screen_y),
+            egui::vec2(display_w, display_h),
+        );
+
+        // Draw with opacity
+        let alpha = (ref_info.opacity * 255.0) as u8;
+        let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+
+        painter.image(
+            texture.id(),
+            ref_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            tint,
+        );
+    };
+
+    // Load reference texture if needed and render behind grid (if not show_on_top)
+    if let Some(ref ref_info) = reference_info {
+        if !ref_info.show_on_top {
+            // Try to get cached texture or load it
+            if !state.reference_texture_cache.contains_key(&ref_info.file_path) {
+                if let Ok((texture, original_size, using_fallback)) = load_reference_texture(
+                    ui.ctx(),
+                    &ref_info.file_path,
+                    ref_info.thumbnail.as_deref(),
+                ) {
+                    state.reference_texture_cache.insert(ref_info.file_path.clone(), (texture, original_size));
+                    state.reference_using_fallback.insert(ref_info.file_path.clone(), using_fallback);
+                }
+            }
+
+            if let Some((texture, original_size)) = state.reference_texture_cache.get(&ref_info.file_path) {
+                render_reference(&painter, ref_info, texture, *original_size);
+            }
+        }
+    }
 
     // Draw grid if enabled
     if state.show_grid {
@@ -2211,8 +2431,62 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Handle panning - space uses pointer movement, middle mouse uses drag
-    if space_held {
+    // Render reference image on top (if show_on_top)
+    if let Some(ref ref_info) = reference_info {
+        if ref_info.show_on_top {
+            // Try to get cached texture or load it
+            if !state.reference_texture_cache.contains_key(&ref_info.file_path) {
+                if let Ok((texture, original_size, using_fallback)) = load_reference_texture(
+                    ui.ctx(),
+                    &ref_info.file_path,
+                    ref_info.thumbnail.as_deref(),
+                ) {
+                    state.reference_texture_cache.insert(ref_info.file_path.clone(), (texture, original_size));
+                    state.reference_using_fallback.insert(ref_info.file_path.clone(), using_fallback);
+                }
+            }
+
+            if let Some((texture, original_size)) = state.reference_texture_cache.get(&ref_info.file_path) {
+                render_reference(&painter, ref_info, texture, *original_size);
+            }
+        }
+    }
+
+    // Check for shift key for reference image dragging
+    let shift_held = ui.input(|i| i.modifiers.shift);
+    let has_reference = reference_info.is_some();
+
+    // Handle Shift+MMB/Space for reference image dragging
+    if shift_held && has_reference && (space_held || middle_mouse_held) {
+        let delta = if space_held {
+            ui.input(|i| i.pointer.delta())
+        } else {
+            response.drag_delta()
+        };
+
+        // Convert screen delta to canvas coordinates
+        let canvas_delta_x = delta.x / effective_zoom;
+        let canvas_delta_y = delta.y / effective_zoom;
+
+        // Update reference position in project
+        if let Some(ref mut project) = state.project {
+            if let Some(ref cn) = state.active_character {
+                if let Some(character) = project.get_character_mut(cn) {
+                    if let Some(anim) = character.animations.get_mut(state.current_animation) {
+                        if let Some(frame) = anim.frames.get_mut(state.current_frame) {
+                            if let Some(ref mut frame_ref) = frame.reference {
+                                frame_ref.position.0 += canvas_delta_x;
+                                frame_ref.position.1 += canvas_delta_y;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Set cursor to indicate dragging
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+    } else if space_held {
         // Space: pan by just moving the mouse (no click needed)
         let delta = ui.input(|i| i.pointer.delta());
         state.canvas_offset.0 += delta.x;
@@ -3164,6 +3438,96 @@ fn decode_base64_to_texture(
         color_image,
         egui::TextureOptions::NEAREST, // Pixel art should use nearest neighbor
     ))
+}
+
+/// Create a small JPG thumbnail for a reference image (for fallback when file is missing)
+fn create_reference_thumbnail(path: &str, max_size: u32) -> Result<(String, (u32, u32)), String> {
+    use base64::Engine;
+
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("Invalid image: {}", e))?;
+
+    let original_size = (img.width(), img.height());
+
+    // Scale down to fit within max_size
+    let (width, height) = original_size;
+    let img = if width > max_size || height > max_size {
+        let scale = (max_size as f32 / width as f32).min(max_size as f32 / height as f32);
+        let new_width = (width as f32 * scale) as u32;
+        let new_height = (height as f32 * scale) as u32;
+        img.resize(new_width, new_height, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+
+    // Encode as JPG with quality 80
+    let mut jpg_bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut jpg_bytes);
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+
+    Ok((base64::engine::general_purpose::STANDARD.encode(&jpg_bytes), original_size))
+}
+
+/// Calculate scale factor to fit an image within the canvas while preserving aspect ratio
+fn calculate_fit_scale(image_size: (u32, u32), canvas_size: (u32, u32)) -> f32 {
+    let scale_x = canvas_size.0 as f32 / image_size.0 as f32;
+    let scale_y = canvas_size.1 as f32 / image_size.1 as f32;
+    scale_x.min(scale_y)
+}
+
+/// Load reference image texture, falling back to thumbnail if file is missing
+fn load_reference_texture(
+    ctx: &egui::Context,
+    file_path: &str,
+    thumbnail_fallback: Option<&str>,
+) -> Result<(egui::TextureHandle, (u32, u32), bool), String> {
+    use base64::Engine;
+
+    // Try loading from file first
+    if let Ok(bytes) = fs::read(file_path) {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            let original_size = (img.width(), img.height());
+            let rgba = img.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let pixels = rgba.into_raw();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+
+            let texture = ctx.load_texture(
+                file_path,
+                color_image,
+                egui::TextureOptions::LINEAR, // Reference images use linear filtering
+            );
+            return Ok((texture, original_size, false)); // false = not using fallback
+        }
+    }
+
+    // Fall back to thumbnail
+    if let Some(thumbnail_data) = thumbnail_fallback {
+        let jpg_bytes = base64::engine::general_purpose::STANDARD
+            .decode(thumbnail_data)
+            .map_err(|e| format!("Failed to decode thumbnail: {}", e))?;
+
+        let img = image::load_from_memory(&jpg_bytes)
+            .map_err(|e| format!("Failed to load thumbnail: {}", e))?;
+
+        let size = (img.width(), img.height());
+        let rgba = img.to_rgba8();
+        let pixels = rgba.into_raw();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [size.0 as usize, size.1 as usize],
+            &pixels,
+        );
+
+        let texture = ctx.load_texture(
+            &format!("{}_thumb", file_path),
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        return Ok((texture, size, true)); // true = using fallback
+    }
+
+    Err(format!("File not found and no thumbnail available: {}", file_path))
 }
 
 /// Render a single frame to an RGBA image buffer

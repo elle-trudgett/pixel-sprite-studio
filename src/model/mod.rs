@@ -216,6 +216,28 @@ impl PlacedPart {
     }
 }
 
+/// Reference image for a single frame
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameReference {
+    pub file_path: String,           // Original file path
+    pub position: (f32, f32),        // Canvas-relative position
+    pub scale: f32,                  // Scale factor (1.0 = fit canvas)
+    pub opacity: f32,                // 0.0 to 1.0, default 0.5
+    pub show_on_top: bool,           // Above layers instead of below grid
+}
+
+impl FrameReference {
+    pub fn new(file_path: String, scale: f32) -> Self {
+        Self {
+            file_path,
+            position: (0.0, 0.0),
+            scale,
+            opacity: 0.5,
+            show_on_top: false,
+        }
+    }
+}
+
 /// A single frame in an animation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
@@ -223,6 +245,9 @@ pub struct Frame {
     pub placed_parts: Vec<PlacedPart>,
     /// Z-index overrides at the frame level (part_name -> z_index)
     pub z_overrides: HashMap<String, i32>,
+    /// Optional reference image for this frame
+    #[serde(default)]
+    pub reference: Option<FrameReference>,
 }
 
 impl Frame {
@@ -231,6 +256,7 @@ impl Frame {
             duration_ms,
             placed_parts: Vec::new(),
             z_overrides: HashMap::new(),
+            reference: None,
         }
     }
 }
@@ -308,7 +334,12 @@ pub struct Project {
     /// Legacy field for v1 compatibility - animations are now per-character
     #[serde(default, skip_serializing)]
     pub animations: Vec<Animation>,
+    /// Legacy field - reference images are now per-frame
+    #[serde(default, skip_serializing)]
     pub reference_layer: ReferenceLayer,
+    /// Deduplicated reference image thumbnails (file_path -> base64 JPG)
+    #[serde(default)]
+    pub reference_thumbnails: HashMap<String, String>,
     #[serde(skip)]
     pub next_part_id: u64, // Runtime counter for unique part placement IDs
 }
@@ -328,6 +359,7 @@ impl Project {
             characters: Vec::new(),
             animations: Vec::new(), // Empty - animations are per-character now
             reference_layer: ReferenceLayer::new(),
+            reference_thumbnails: HashMap::new(),
             next_part_id: 1,
         }
     }
