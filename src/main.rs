@@ -312,6 +312,9 @@ struct AppState {
     // Drag from gallery state
     gallery_drag: Option<GalleryDrag>,
 
+    // Menu state
+    reopen_view_menu: bool,
+
     // Dialogs
     show_new_character_dialog: bool,
     show_new_part_dialog: bool,
@@ -420,6 +423,7 @@ impl AppState {
             drag_offset: (0.0, 0.0),
             drag_accumulator: (0.0, 0.0),
             gallery_drag: None,
+            reopen_view_menu: false,
             show_new_character_dialog: false,
             show_new_part_dialog: false,
             show_new_state_dialog: false,
@@ -868,6 +872,27 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
     style.wrap_mode = Some(egui::TextWrapMode::Extend);
     ctx.set_style(style);
 
+    // Global keyboard shortcuts for UI scale (Ctrl+Shift+Plus/Minus/0)
+    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Plus))
+        || ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Equals)) {
+        if state.config.ui_scale < 2.0 {
+            state.config.ui_scale = (state.config.ui_scale + 0.25).min(2.0);
+            state.config.save();
+        }
+    }
+    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Minus)) {
+        if state.config.ui_scale > 0.75 {
+            state.config.ui_scale = (state.config.ui_scale - 0.25).max(0.75);
+            state.config.save();
+        }
+    }
+    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Num0)) {
+        if state.config.ui_scale != 1.0 {
+            state.config.ui_scale = 1.0;
+            state.config.save();
+        }
+    }
+
     // Handle animation playback
     if state.is_playing {
         let delta = time.delta_secs();
@@ -968,20 +993,45 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button(egui::RichText::new("View").size(menu_font_size), |ui| {
+            let view_menu_id = ui.make_persistent_id("view_menu");
+            if state.reopen_view_menu {
+                state.reopen_view_menu = false;
+                ui.memory_mut(|mem| mem.open_popup(view_menu_id));
+            }
+            egui::menu::menu_button(ui, egui::RichText::new("View").size(menu_font_size), |ui| {
+                let mut scale_changed = false;
                 ui.horizontal(|ui| {
                     ui.label("UI Scale:");
                     let button_size = scaled_margin(20.0, state.config.ui_scale);
-                    if ui.add_sized([button_size, button_size], egui::Button::new("−")).clicked() && state.config.ui_scale > 0.75 {
+                    if ui.add_sized([button_size, button_size], egui::Button::new("−"))
+                        .on_hover_text("Decrease UI scale (Ctrl+Shift+−)")
+                        .clicked() && state.config.ui_scale > 0.75 {
                         state.config.ui_scale = (state.config.ui_scale - 0.25).max(0.75);
                         state.config.save();
+                        scale_changed = true;
                     }
                     ui.label(format!("{:.0}%", state.config.ui_scale * 100.0));
-                    if ui.add_sized([button_size, button_size], egui::Button::new("+")).clicked() && state.config.ui_scale < 2.0 {
+                    if ui.add_sized([button_size, button_size], egui::Button::new("+"))
+                        .on_hover_text("Increase UI scale (Ctrl+Shift++)")
+                        .clicked() && state.config.ui_scale < 2.0 {
                         state.config.ui_scale = (state.config.ui_scale + 0.25).min(2.0);
                         state.config.save();
+                        scale_changed = true;
+                    }
+                    if state.config.ui_scale != 1.0 {
+                        if ui.small_button("Reset")
+                            .on_hover_text("Reset to 100% (Ctrl+Shift+0)")
+                            .clicked() {
+                            state.config.ui_scale = 1.0;
+                            state.config.save();
+                            scale_changed = true;
+                        }
                     }
                 });
+                if scale_changed {
+                    state.reopen_view_menu = true;
+                    ui.close_menu();
+                }
                 ui.separator();
                 ui.checkbox(&mut state.show_grid, "Show Grid");
                 ui.checkbox(&mut state.show_labels, "Show Labels");
@@ -1630,7 +1680,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     let can_move_up = *idx < layers_len - 1;
                                     let shift_held = ui.input(|i| i.modifiers.shift);
                                     if ui.add_sized([button_width, row_height], egui::Button::new("⏶").small().sense(if can_move_up { egui::Sense::click() } else { egui::Sense::hover() }))
-                                        .on_hover_text("Move layer up (Hold Shift to move to top)")
+                                        .on_hover_text("Move layer up (Shift-Click to move to top)")
                                         .clicked() && can_move_up {
                                         if shift_held {
                                             move_to_top = Some(*idx);
@@ -1642,7 +1692,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     // Column 4: Move down (fixed width)
                                     let can_move_down = *idx > 0;
                                     if ui.add_sized([button_width, row_height], egui::Button::new("⏷").small().sense(if can_move_down { egui::Sense::click() } else { egui::Sense::hover() }))
-                                        .on_hover_text("Move layer down (Hold Shift to move to bottom)")
+                                        .on_hover_text("Move layer down (Shift-Click to move to bottom)")
                                         .clicked() && can_move_down {
                                         if shift_held {
                                             move_to_bottom = Some(*idx);
@@ -2256,9 +2306,10 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         let card_rect = card_response.inner.response.rect;
 
                         // Draw X button at top right corner of card
-                        let button_size = 24.0;
+                        let button_size = scaled_margin(24.0, ui_scale);
+                        let button_margin = scaled_margin(4.0, ui_scale);
                         let button_rect = egui::Rect::from_min_size(
-                            egui::pos2(card_rect.right() - button_size - 4.0, card_rect.top() + 4.0),
+                            egui::pos2(card_rect.right() - button_size - button_margin, card_rect.top() + button_margin),
                             egui::vec2(button_size, button_size),
                         );
                         let button_response = ui.interact(button_rect, ui.id().with(path), egui::Sense::click());
@@ -3585,29 +3636,30 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     // Overlay info (character name, animation name, canvas info)
     if state.show_overlay_info {
         // Character and animation name at top left corner
+        let ui_scale = state.config.ui_scale;
         if !char_name.is_empty() {
             painter.text(
-                response.rect.min + egui::vec2(10.0, 10.0),
+                response.rect.min + egui::vec2(scaled_margin(10.0, ui_scale), scaled_margin(10.0, ui_scale)),
                 egui::Align2::LEFT_TOP,
                 &char_name,
-                egui::FontId::proportional(scaled_font(24.0, state.config.ui_scale)),
+                egui::FontId::proportional(scaled_font(24.0, ui_scale)),
                 egui::Color32::WHITE,
             );
             painter.text(
-                response.rect.min + egui::vec2(10.0, 40.0),
+                response.rect.min + egui::vec2(scaled_margin(10.0, ui_scale), scaled_margin(40.0, ui_scale)),
                 egui::Align2::LEFT_TOP,
                 &anim_name,
-                egui::FontId::proportional(scaled_font(18.0, state.config.ui_scale)),
+                egui::FontId::proportional(scaled_font(18.0, ui_scale)),
                 egui::Color32::GRAY,
             );
             // Frame count, FPS, and duration
             if let Some((frame_count, fps)) = anim_info {
                 let duration = frame_count as f32 / fps as f32;
                 painter.text(
-                    response.rect.min + egui::vec2(10.0, 64.0),
+                    response.rect.min + egui::vec2(scaled_margin(10.0, ui_scale), scaled_margin(64.0, ui_scale)),
                     egui::Align2::LEFT_TOP,
                     format!("{} frames @ {}fps = {:.2}s", frame_count, fps, duration),
-                    egui::FontId::proportional(scaled_font(14.0, state.config.ui_scale)),
+                    egui::FontId::proportional(scaled_font(14.0, ui_scale)),
                     egui::Color32::from_gray(140),
                 );
             }
@@ -3616,10 +3668,10 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         // Canvas info at bottom left corner
         let parts_count = placed_parts.len();
         painter.text(
-            egui::pos2(response.rect.min.x + 10.0, response.rect.max.y - 10.0),
+            egui::pos2(response.rect.min.x + scaled_margin(10.0, ui_scale), response.rect.max.y - scaled_margin(10.0, ui_scale)),
             egui::Align2::LEFT_BOTTOM,
             format!("{}x{} @ {:.1}x | {} parts", canvas_size.0, canvas_size.1, state.zoom_level, parts_count),
-            egui::FontId::proportional(scaled_font(12.0, state.config.ui_scale)),
+            egui::FontId::proportional(scaled_font(12.0, ui_scale)),
             egui::Color32::GRAY,
         );
     }
