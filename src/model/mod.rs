@@ -140,6 +140,12 @@ pub struct Character {
     pub parts: Vec<Part>,
     #[serde(default)]
     pub animations: Vec<Animation>,
+    #[serde(default = "default_canvas_size")]
+    pub canvas_size: (u32, u32),
+}
+
+fn default_canvas_size() -> (u32, u32) {
+    (64, 64)
 }
 
 impl Character {
@@ -148,6 +154,7 @@ impl Character {
             name: name.into(),
             parts: Vec::new(),
             animations: vec![Animation::new("Untitled Animation")],
+            canvas_size: (64, 64),
         }
     }
 
@@ -188,6 +195,12 @@ pub struct PlacedPart {
     pub rotation: u16,       // Current rotation angle
     pub position: (f32, f32), // (x, y) position on canvas
     pub z_override: Option<i32>, // Frame-level z-index override
+    #[serde(default = "default_visible")]
+    pub visible: bool, // Whether this layer is visible
+}
+
+fn default_visible() -> bool {
+    true
 }
 
 impl PlacedPart {
@@ -207,6 +220,7 @@ impl PlacedPart {
             rotation: 0,
             position: (0.0, 0.0),
             z_override: None,
+            visible: true,
         }
     }
 
@@ -222,8 +236,7 @@ pub struct FrameReference {
     pub file_path: String,           // Original file path
     pub position: (f32, f32),        // Canvas-relative position
     pub scale: f32,                  // Scale factor (1.0 = fit canvas)
-    pub opacity: f32,                // 0.0 to 1.0, default 0.5
-    pub show_on_top: bool,           // Above layers instead of below grid
+    // Note: opacity and show_on_top are view settings in AppState, not per-frame
 }
 
 impl FrameReference {
@@ -232,8 +245,6 @@ impl FrameReference {
             file_path,
             position: (0.0, 0.0),
             scale,
-            opacity: 0.5,
-            show_on_top: false,
         }
     }
 }
@@ -324,11 +335,64 @@ impl ReferenceLayer {
     }
 }
 
+/// Saved editor state for restoring on load
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorState {
+    #[serde(default)]
+    pub active_character: Option<String>,
+    #[serde(default)]
+    pub current_animation: usize,
+    #[serde(default)]
+    pub current_frame: usize,
+    #[serde(default)]
+    pub active_tab: String, // "canvas" or "editor"
+    #[serde(default = "default_zoom")]
+    pub zoom_level: f32,
+    #[serde(default = "default_true")]
+    pub show_grid: bool,
+    #[serde(default = "default_true")]
+    pub show_labels: bool,
+    #[serde(default = "default_opacity")]
+    pub reference_opacity: f32,
+    #[serde(default)]
+    pub reference_show_on_top: bool,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            active_character: None,
+            current_animation: 0,
+            current_frame: 0,
+            active_tab: "canvas".to_string(),
+            zoom_level: 16.0,
+            show_grid: true,
+            show_labels: true,
+            reference_opacity: 0.5,
+            reference_show_on_top: false,
+        }
+    }
+}
+
+fn default_zoom() -> f32 {
+    16.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_opacity() -> f32 {
+    0.5
+}
+
 /// The complete project containing all data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub version: String,
     pub name: String,
+    /// Legacy field - canvas size is now per-character
+    #[serde(default = "default_canvas_size", skip_serializing)]
     pub canvas_size: (u32, u32),
     pub characters: Vec<Character>,
     /// Legacy field for v1 compatibility - animations are now per-character
@@ -340,6 +404,9 @@ pub struct Project {
     /// Deduplicated reference image thumbnails (file_path -> base64 JPG)
     #[serde(default)]
     pub reference_thumbnails: HashMap<String, String>,
+    /// Saved editor state
+    #[serde(default)]
+    pub editor_state: EditorState,
     #[serde(skip)]
     pub next_part_id: u64, // Runtime counter for unique part placement IDs
 }
@@ -360,6 +427,7 @@ impl Project {
             animations: Vec::new(), // Empty - animations are per-character now
             reference_layer: ReferenceLayer::new(),
             reference_thumbnails: HashMap::new(),
+            editor_state: EditorState::default(),
             next_part_id: 1,
         }
     }
@@ -443,6 +511,15 @@ impl Project {
 
             // Update version to indicate migration happened
             project.version = "2.0".to_string();
+        }
+
+        // Migrate canvas_size from project level to character level
+        // Characters with default canvas size inherit the project's canvas_size
+        let project_canvas = project.canvas_size;
+        for character in &mut project.characters {
+            if character.canvas_size == (64, 64) && project_canvas != (64, 64) {
+                character.canvas_size = project_canvas;
+            }
         }
 
         Ok(project)

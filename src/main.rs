@@ -210,6 +210,10 @@ struct AppState {
     reference_initial_pos: (f32, f32),
     reference_texture_cache: HashMap<String, (egui::TextureHandle, (u32, u32))>, // path -> (texture, original_size)
     reference_using_fallback: HashMap<String, bool>, // path -> whether using thumbnail fallback
+
+    // Reference view settings (global, not per-frame)
+    reference_opacity: f32,
+    reference_show_on_top: bool,
 }
 
 #[derive(Clone)]
@@ -291,6 +295,8 @@ impl AppState {
             reference_initial_pos: (0.0, 0.0),
             reference_texture_cache: HashMap::new(),
             reference_using_fallback: HashMap::new(),
+            reference_opacity: 0.5,
+            reference_show_on_top: false,
         }
     }
 
@@ -396,8 +402,24 @@ impl AppState {
     }
 
     fn save_project(&mut self) -> Result<(), String> {
-        let project = self.project.as_ref().ok_or("No project to save")?;
+        let project = self.project.as_mut().ok_or("No project to save")?;
         let path = self.project_path.as_ref().ok_or("No file path set")?;
+
+        // Save editor state before serializing
+        project.editor_state = model::EditorState {
+            active_character: self.active_character.clone(),
+            current_animation: self.current_animation,
+            current_frame: self.current_frame,
+            active_tab: match &self.active_tab {
+                ActiveTab::Canvas => "canvas".to_string(),
+                ActiveTab::CharacterEditor(_) => "editor".to_string(),
+            },
+            zoom_level: self.zoom_level,
+            show_grid: self.show_grid,
+            show_labels: self.show_labels,
+            reference_opacity: self.reference_opacity,
+            reference_show_on_top: self.reference_show_on_top,
+        };
 
         let json = project.to_json().map_err(|e| format!("Serialize error: {}", e))?;
         fs::write(path, &json).map_err(|e| format!("Write error: {}", e))?;
@@ -422,16 +444,35 @@ impl AppState {
         let json = fs::read_to_string(path).map_err(|e| format!("Read error: {}", e))?;
         let project = Project::from_json(&json).map_err(|e| format!("Parse error: {}", e))?;
 
+        // Restore editor state from project
+        let editor_state = &project.editor_state;
+        self.active_character = editor_state.active_character.clone();
+        self.current_animation = editor_state.current_animation;
+        self.current_frame = editor_state.current_frame;
+        self.zoom_level = editor_state.zoom_level;
+        self.show_grid = editor_state.show_grid;
+        self.show_labels = editor_state.show_labels;
+        self.reference_opacity = editor_state.reference_opacity;
+        self.reference_show_on_top = editor_state.reference_show_on_top;
+
+        // Restore active tab
+        self.active_tab = if editor_state.active_tab == "editor" {
+            if let Some(ref char_name) = self.active_character {
+                ActiveTab::CharacterEditor(char_name.clone())
+            } else {
+                ActiveTab::Canvas
+            }
+        } else {
+            ActiveTab::Canvas
+        };
+
         // Track saved state
         self.last_saved_json = project.to_json().ok();
         self.last_saved_time = Some(std::time::Instant::now());
 
         self.project = Some(project);
         self.project_path = Some(PathBuf::from(path));
-        self.current_animation = 0;
-        self.current_frame = 0;
         self.selected_part_id = None;
-        self.active_character = None;
         self.config.add_recent(path);
 
         Ok(())
@@ -1195,11 +1236,12 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             ui.heading("Layers");
 
             // Get layers for current frame (need to collect info for UI)
-            let layers: Vec<(u64, String, usize)> = {
+            // (id, name, index, visible)
+            let layers: Vec<(u64, String, usize, bool)> = {
                 if let Some(anim) = state.current_animation() {
                     if let Some(frame) = anim.frames.get(state.current_frame) {
                         frame.placed_parts.iter().enumerate()
-                            .map(|(idx, p)| (p.id, if p.layer_name.is_empty() { p.part_name.clone() } else { p.layer_name.clone() }, idx))
+                            .map(|(idx, p)| (p.id, if p.layer_name.is_empty() { p.part_name.clone() } else { p.layer_name.clone() }, idx, p.visible))
                             .collect()
                     } else { vec![] }
                 } else { vec![] }
@@ -1211,13 +1253,20 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 // Show layers in reverse order (top layer first in UI)
                 let mut move_up: Option<usize> = None;
                 let mut move_down: Option<usize> = None;
+                let mut toggle_visibility: Option<usize> = None;
 
-                for (id, name, idx) in layers.iter().rev() {
+                for (id, name, idx, visible) in layers.iter().rev() {
                     let is_selected = state.selected_part_id == Some(*id);
                     let layer_id = *id;
                     let layer_name = name.clone();
 
                     ui.horizontal(|ui| {
+                        // Visibility toggle (eye icon)
+                        let eye_icon = if *visible { "👁" } else { "○" };
+                        if ui.small_button(eye_icon).on_hover_text(if *visible { "Hide layer" } else { "Show layer" }).clicked() {
+                            toggle_visibility = Some(*idx);
+                        }
+
                         // Layer selection
                         let response = ui.selectable_label(is_selected, &format!("{}", name));
                         if response.clicked() {
@@ -1254,6 +1303,25 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             state.show_delete_confirm_dialog = true;
                         }
                     });
+                }
+
+                // Apply visibility toggle
+                if let Some(idx) = toggle_visibility {
+                    let current_anim = state.current_animation;
+                    let current_frame_idx = state.current_frame;
+                    if let Some(ref char_name) = state.active_character.clone() {
+                        if let Some(ref mut project) = state.project {
+                            if let Some(character) = project.get_character_mut(char_name) {
+                                if let Some(anim) = character.animations.get_mut(current_anim) {
+                                    if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                        if let Some(part) = frame.placed_parts.get_mut(idx) {
+                                            part.visible = !part.visible;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Apply layer reordering
@@ -1294,34 +1362,6 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
             ui.separator();
 
-            // Canvas Settings
-            ui.heading("Canvas Settings");
-            if let Some(ref mut project) = state.project {
-                ui.horizontal(|ui| {
-                    ui.label("Size:");
-                    let mut w = project.canvas_size.0 as i32;
-                    let mut h = project.canvas_size.1 as i32;
-                    ui.add(egui::DragValue::new(&mut w).speed(1).range(8..=512));
-                    ui.label("x");
-                    ui.add(egui::DragValue::new(&mut h).speed(1).range(8..=512));
-                    project.canvas_size = (w.max(8) as u32, h.max(8) as u32);
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.label("Zoom:");
-                egui::ComboBox::from_id_salt("zoom_level_canvas")
-                    .selected_text(format!("{:.2}x", state.zoom_level))
-                    .show_ui(ui, |ui| {
-                        for &level in &ZOOM_LEVELS {
-                            ui.selectable_value(&mut state.zoom_level, level, format!("{:.2}x", level));
-                        }
-                    });
-            });
-            ui.checkbox(&mut state.show_grid, "Show grid");
-            ui.checkbox(&mut state.show_labels, "Show labels");
-
-            ui.separator();
-
             // Reference Image (per-frame)
             ui.heading("Reference Image");
 
@@ -1343,9 +1383,16 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 })
             });
 
+            // Check if using fallback (before mutable borrow)
+            let using_fallback = current_frame_ref.as_ref()
+                .and_then(|path| state.reference_using_fallback.get(path).copied())
+                .unwrap_or(false);
+
             // Track what actions to take after UI
             let mut load_clicked = false;
             let mut clear_clicked = false;
+            let mut copy_to_all_clicked = false;
+            let mut copy_settings: Option<(f32, (f32, f32))> = None; // scale, position
 
             ui.horizontal(|ui| {
                 if ui.button("Load Image...").clicked() {
@@ -1376,20 +1423,24 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         }
                     }
 
-                    // Calculate fit-to-canvas scale
-                    let canvas_size = project.canvas_size;
-                    let scale = if let Ok(bytes) = fs::read(&path_str) {
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            calculate_fit_scale((img.width(), img.height()), canvas_size)
-                        } else {
-                            1.0
-                        }
-                    } else {
-                        1.0
-                    };
-
                     // Set reference on current frame
                     if let Some(ref cn) = char_name {
+                        // Get canvas size from character
+                        let canvas_size = project.get_character(cn)
+                            .map(|c| c.canvas_size)
+                            .unwrap_or((64, 64));
+
+                        // Calculate fit-to-canvas scale
+                        let scale = if let Ok(bytes) = fs::read(&path_str) {
+                            if let Ok(img) = image::load_from_memory(&bytes) {
+                                calculate_fit_scale((img.width(), img.height()), canvas_size)
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            1.0
+                        };
+
                         if let Some(character) = project.get_character_mut(cn) {
                             if let Some(anim) = character.animations.get_mut(current_anim) {
                                 if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
@@ -1428,13 +1479,6 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         if let Some(anim) = character.animations.get_mut(current_anim) {
                             if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
                                 if let Some(ref mut frame_ref) = frame.reference {
-                                    ui.checkbox(&mut frame_ref.show_on_top, "Show on top");
-
-                                    ui.horizontal(|ui| {
-                                        ui.label("Opacity:");
-                                        ui.add(egui::Slider::new(&mut frame_ref.opacity, 0.0..=1.0));
-                                    });
-
                                     ui.horizontal(|ui| {
                                         ui.label("Scale:");
                                         ui.add(egui::DragValue::new(&mut frame_ref.scale).speed(0.01).range(0.01..=10.0));
@@ -1453,19 +1497,46 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                         frame_ref.file_path.clone()
                                     };
 
-                                    // Check if using fallback
-                                    let file_path_clone = frame_ref.file_path.clone();
-                                    let using_fallback = state.reference_using_fallback
-                                        .get(&file_path_clone)
-                                        .copied()
-                                        .unwrap_or(false);
-
                                     if using_fallback {
                                         ui.colored_label(egui::Color32::YELLOW, "File missing (using thumbnail)");
                                     }
                                     ui.small(&display_path);
 
+                                    ui.add_space(4.0);
+                                    if ui.button("Copy to all frames").clicked() {
+                                        copy_to_all_clicked = true;
+                                        copy_settings = Some((
+                                            frame_ref.scale,
+                                            frame_ref.position,
+                                        ));
+                                    }
+
                                     ui.small("Shift+MMB/Space to drag");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle copy to all frames action
+            if copy_to_all_clicked {
+                if let Some((scale, position)) = copy_settings {
+                    if let Some(ref mut project) = state.project {
+                        if let Some(ref cn) = char_name {
+                            if let Some(character) = project.get_character_mut(cn) {
+                                if let Some(anim) = character.animations.get_mut(current_anim) {
+                                    let mut count = 0;
+                                    for (i, frame) in anim.frames.iter_mut().enumerate() {
+                                        if i != current_frame_idx {
+                                            if let Some(ref mut frame_ref) = frame.reference {
+                                                frame_ref.scale = scale;
+                                                frame_ref.position = position;
+                                                count += 1;
+                                            }
+                                        }
+                                    }
+                                    state.set_status(format!("Copied settings to {} other frames", count));
                                 }
                             }
                         }
@@ -1800,6 +1871,29 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 // Tab content
                 match &state.active_tab {
                     ActiveTab::Canvas => {
+                        // View options bar (horizontal, under tabs)
+                        ui.horizontal(|ui| {
+                            ui.label("Zoom:");
+                            egui::ComboBox::from_id_salt("zoom_level_canvas")
+                                .selected_text(format!("{:.0}x", state.zoom_level))
+                                .width(50.0)
+                                .show_ui(ui, |ui| {
+                                    for &level in &ZOOM_LEVELS {
+                                        ui.selectable_value(&mut state.zoom_level, level, format!("{:.0}x", level));
+                                    }
+                                });
+
+                            ui.separator();
+                            ui.checkbox(&mut state.show_grid, "Grid");
+                            ui.checkbox(&mut state.show_labels, "Labels");
+
+                            ui.separator();
+                            ui.label("Ref:");
+                            ui.add_sized([60.0, 18.0], egui::Slider::new(&mut state.reference_opacity, 0.0..=1.0).show_value(false));
+                            ui.checkbox(&mut state.reference_show_on_top, "On top");
+                        });
+                        ui.separator();
+
                         render_canvas(ui, &mut state);
                     }
                     ActiveTab::CharacterEditor(_) => {
@@ -1867,6 +1961,52 @@ fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_name: &
 
         (parts, selected_part_states, selected_state_rotations)
     };
+
+    // Character settings
+    ui.heading("Character Settings");
+
+    // Name field for renaming
+    let mut new_name = char_name.to_string();
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        ui.text_edit_singleline(&mut new_name);
+    });
+
+    // Handle rename if name changed
+    if new_name != char_name && !new_name.is_empty() {
+        if let Some(ref mut project) = state.project {
+            // Check if new name doesn't conflict with existing character
+            let name_exists = project.characters.iter().any(|c| c.name == new_name);
+            if !name_exists {
+                if let Some(character) = project.get_character_mut(char_name) {
+                    character.name = new_name.clone();
+                }
+                // Update active character reference
+                state.active_character = Some(new_name.clone());
+                // Update active tab if it references this character
+                if let ActiveTab::CharacterEditor(_) = state.active_tab {
+                    state.active_tab = ActiveTab::CharacterEditor(new_name);
+                }
+            }
+        }
+    }
+
+    // Frame size
+    ui.horizontal(|ui| {
+        ui.label("Frame size:");
+        if let Some(ref mut project) = state.project {
+            if let Some(character) = project.get_character_mut(char_name) {
+                let mut w = character.canvas_size.0 as i32;
+                let mut h = character.canvas_size.1 as i32;
+                ui.add(egui::DragValue::new(&mut w).speed(1).range(8..=512));
+                ui.label("x");
+                ui.add(egui::DragValue::new(&mut h).speed(1).range(8..=512));
+                character.canvas_size = (w.max(8) as u32, h.max(8) as u32);
+            }
+        }
+    });
+
+    ui.separator();
 
     // Three-column layout: 20% / 20% / 60%
     let available_width = ui.available_width();
@@ -2137,6 +2277,7 @@ struct PlacedPartRenderInfo {
     rotation: u16,
     position: (f32, f32),
     image_data: Option<String>,
+    visible: bool,
 }
 
 fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
@@ -2145,8 +2286,6 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         file_path: String,
         position: (f32, f32),
         scale: f32,
-        opacity: f32,
-        show_on_top: bool,
         thumbnail: Option<String>,
     }
 
@@ -2172,8 +2311,6 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 file_path: r.file_path.clone(),
                 position: r.position,
                 scale: r.scale,
-                opacity: r.opacity,
-                show_on_top: r.show_on_top,
                 thumbnail: project.reference_thumbnails.get(&r.file_path).cloned(),
             });
 
@@ -2200,13 +2337,20 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                             rotation: p.rotation,
                             position: p.position,
                             image_data,
+                            visible: p.visible,
                         }
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        (project.canvas_size, parts, char_name, anim_name, reference_info)
+        // Get canvas size from active character
+        let canvas_size = active_char
+            .and_then(|name| project.get_character(name))
+            .map(|c| c.canvas_size)
+            .unwrap_or((64, 64));
+
+        (canvas_size, parts, char_name, anim_name, reference_info)
     };
 
     let available = ui.available_size();
@@ -2241,8 +2385,10 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(40, 40, 50));
 
     // Helper to render reference image
+    let reference_opacity = state.reference_opacity;
+    let reference_show_on_top = state.reference_show_on_top;
     let render_reference = |painter: &egui::Painter, ref_info: &ReferenceRenderInfo,
-                            texture: &egui::TextureHandle, original_size: (u32, u32)| {
+                            texture: &egui::TextureHandle, original_size: (u32, u32), opacity: f32| {
         // Calculate position in screen space
         let screen_x = canvas_rect.min.x + ref_info.position.0 * effective_zoom;
         let screen_y = canvas_rect.min.y + ref_info.position.1 * effective_zoom;
@@ -2257,7 +2403,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         );
 
         // Draw with opacity
-        let alpha = (ref_info.opacity * 255.0) as u8;
+        let alpha = (opacity * 255.0) as u8;
         let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
 
         painter.image(
@@ -2270,7 +2416,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Load reference texture if needed and render behind grid (if not show_on_top)
     if let Some(ref ref_info) = reference_info {
-        if !ref_info.show_on_top {
+        if !reference_show_on_top {
             // Try to get cached texture or load it
             if !state.reference_texture_cache.contains_key(&ref_info.file_path) {
                 if let Ok((texture, original_size, using_fallback)) = load_reference_texture(
@@ -2284,7 +2430,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             }
 
             if let Some((texture, original_size)) = state.reference_texture_cache.get(&ref_info.file_path) {
-                render_reference(&painter, ref_info, texture, *original_size);
+                render_reference(&painter, ref_info, texture, *original_size, reference_opacity);
             }
         }
     }
@@ -2323,6 +2469,11 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     // Draw placed parts (in list order - later items drawn on top)
     let show_labels = state.show_labels;
     for part_info in &placed_parts {
+        // Skip invisible layers
+        if !part_info.visible {
+            continue;
+        }
+
         let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
         let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
 
@@ -2433,7 +2584,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Render reference image on top (if show_on_top)
     if let Some(ref ref_info) = reference_info {
-        if ref_info.show_on_top {
+        if reference_show_on_top {
             // Try to get cached texture or load it
             if !state.reference_texture_cache.contains_key(&ref_info.file_path) {
                 if let Ok((texture, original_size, using_fallback)) = load_reference_texture(
@@ -2447,7 +2598,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             }
 
             if let Some((texture, original_size)) = state.reference_texture_cache.get(&ref_info.file_path) {
-                render_reference(&painter, ref_info, texture, *original_size);
+                render_reference(&painter, ref_info, texture, *original_size, reference_opacity);
             }
         }
     }
@@ -2497,6 +2648,13 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         state.canvas_offset.0 += delta.x;
         state.canvas_offset.1 += delta.y;
     }
+
+    // Clamp canvas offset so canvas center stays within viewport
+    // This ensures the canvas can never be panned completely out of view
+    let max_offset_x = available.x * 0.5;
+    let max_offset_y = available.y * 0.5;
+    state.canvas_offset.0 = state.canvas_offset.0.clamp(-max_offset_x, max_offset_x);
+    state.canvas_offset.1 = state.canvas_offset.1.clamp(-max_offset_y, max_offset_y);
 
     // Handle gallery drag drop onto canvas
     let mouse_released = ui.input(|i| i.pointer.any_released());
@@ -2669,13 +2827,45 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Handle mouse wheel for zooming
+    // Handle mouse wheel for zooming (zoom towards cursor)
     if response.hovered() {
         let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll_delta > 0.0 {
-            state.zoom_in();
-        } else if scroll_delta < 0.0 {
-            state.zoom_out();
+        if scroll_delta != 0.0 {
+            if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                // Calculate canvas coordinate under mouse before zoom
+                let old_effective_zoom = effective_zoom;
+                let canvas_coord_x = (mouse_pos.x - canvas_rect.min.x) / old_effective_zoom;
+                let canvas_coord_y = (mouse_pos.y - canvas_rect.min.y) / old_effective_zoom;
+
+                // Apply zoom
+                let old_zoom_level = state.zoom_level;
+                if scroll_delta > 0.0 {
+                    state.zoom_in();
+                } else {
+                    state.zoom_out();
+                }
+
+                // Adjust canvas offset to keep the same canvas coordinate under the mouse
+                if state.zoom_level != old_zoom_level {
+                    let new_effective_zoom = state.zoom_level / ppp;
+                    let new_canvas_w = canvas_size.0 as f32 * new_effective_zoom;
+                    let new_canvas_h = canvas_size.1 as f32 * new_effective_zoom;
+
+                    // Where the mouse is relative to the response rect
+                    let mouse_rel_x = mouse_pos.x - response.rect.min.x;
+                    let mouse_rel_y = mouse_pos.y - response.rect.min.y;
+
+                    // New offset to keep canvas_coord under mouse
+                    state.canvas_offset.0 = mouse_rel_x - canvas_coord_x * new_effective_zoom - (available.x - new_canvas_w) / 2.0;
+                    state.canvas_offset.1 = mouse_rel_y - canvas_coord_y * new_effective_zoom - (available.y - new_canvas_h) / 2.0;
+
+                    // Re-apply clamping
+                    let max_offset_x = available.x * 0.5;
+                    let max_offset_y = available.y * 0.5;
+                    state.canvas_offset.0 = state.canvas_offset.0.clamp(-max_offset_x, max_offset_x);
+                    state.canvas_offset.1 = state.canvas_offset.1.clamp(-max_offset_y, max_offset_y);
+                }
+            }
         }
     }
 
@@ -3535,15 +3725,21 @@ fn render_frame_to_image(
     project: &Project,
     animation: &model::Animation,
     frame_idx: usize,
+    canvas_size: (u32, u32),
 ) -> Result<image::RgbaImage, String> {
     let frame = animation.frames.get(frame_idx)
         .ok_or_else(|| format!("Frame {} not found", frame_idx))?;
 
-    let (canvas_w, canvas_h) = project.canvas_size;
+    let (canvas_w, canvas_h) = canvas_size;
     let mut canvas = image::RgbaImage::new(canvas_w, canvas_h);
 
     // Draw each placed part (in order - later parts on top)
     for placed in &frame.placed_parts {
+        // Skip invisible layers
+        if !placed.visible {
+            continue;
+        }
+
         // Find the part's image data
         let image_data = project.get_character(&placed.character_name)
             .and_then(|c| c.get_part(&placed.part_name))
@@ -3612,7 +3808,7 @@ fn export_current_animation(state: &AppState, output_path: &str) -> Result<(Stri
         return Err("Animation has no frames".to_string());
     }
 
-    let (canvas_w, canvas_h) = project.canvas_size;
+    let (canvas_w, canvas_h) = character.canvas_size;
     let frame_count = animation.frames.len();
 
     // Calculate spritesheet dimensions (horizontal strip for small counts, grid for larger)
@@ -3630,8 +3826,9 @@ fn export_current_animation(state: &AppState, output_path: &str) -> Result<(Stri
 
     // Render each frame and place it in the spritesheet
     let mut frame_metadata = Vec::new();
+    let canvas_size = character.canvas_size;
     for (i, frame) in animation.frames.iter().enumerate() {
-        let frame_img = render_frame_to_image(project, animation, i)?;
+        let frame_img = render_frame_to_image(project, animation, i, canvas_size)?;
 
         let col = i % cols;
         let row = i / cols;
@@ -3696,7 +3893,8 @@ fn export_all_animations(state: &AppState, output_dir: &str) -> Result<usize, St
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
     let mut exported_count = 0;
-    let (canvas_w, canvas_h) = project.canvas_size;
+    let (canvas_w, canvas_h) = character.canvas_size;
+    let canvas_size = character.canvas_size;
 
     for animation in &character.animations {
         if animation.frames.is_empty() {
@@ -3721,7 +3919,7 @@ fn export_all_animations(state: &AppState, output_dir: &str) -> Result<usize, St
         // Render each frame
         let mut frame_metadata = Vec::new();
         for (i, frame) in animation.frames.iter().enumerate() {
-            let frame_img = render_frame_to_image(project, animation, i)?;
+            let frame_img = render_frame_to_image(project, animation, i, canvas_size)?;
 
             let col = i % cols;
             let row = i / cols;
