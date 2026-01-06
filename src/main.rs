@@ -60,7 +60,7 @@ fn format_relative_time(instant: std::time::Instant) -> String {
 /// Render a tab-style button that looks distinct from regular selectable labels
 fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egui::Response {
     let text = text.into();
-    let padding = egui::vec2(12.0, 6.0);
+    let padding = egui::vec2(8.0, 4.0);
 
     let text_color = if selected {
         egui::Color32::WHITE
@@ -1042,7 +1042,19 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     ui.separator();
 
                     // Animations list
-                    ui.heading("Animations");
+                    ui.horizontal(|ui| {
+                        ui.heading("Animations");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Use available height (matched to heading) for both dimensions to make it square
+                            let size = ui.available_height();
+                            if ui.add(egui::Button::new(egui::RichText::new("+").strong().size(16.0)).min_size(egui::vec2(size, size)))
+                                .on_hover_text("New animation")
+                                .clicked() {
+                                state.show_new_animation_dialog = true;
+                                state.new_animation_name.clear();
+                            }
+                        });
+                    });
                     if let Some(character) = project.get_character(&active_char) {
                         let available_width = ui.available_width();
                         egui::Frame::none()
@@ -1094,14 +1106,6 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     });
                                 }
                             });
-
-                        if ui.add_sized(
-                            [ui.available_width(), 0.0],
-                            egui::Button::new("New animation"),
-                        ).clicked() {
-                            state.show_new_animation_dialog = true;
-                            state.new_animation_name.clear();
-                        }
                     }
                 } else if project.characters.is_empty() {
                     ui.label("No characters yet. Create one above.");
@@ -1271,7 +1275,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     };
 
                     if let Some((_character_name, part_name, current_state, position, rotation, _z_override)) = selected_info {
-                        ui.label(format!("Selected part: {}", part_name));
+                        ui.label(format!("Selected layer: {}", part_name));
                         ui.separator();
 
                         // State selector
@@ -1343,7 +1347,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         });
 
                     } else {
-                        ui.label("No selected part");
+                        ui.label("No layer selected");
                     }
                 },
             );
@@ -1433,6 +1437,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     // Column 3: Move up (fixed width)
                                     let can_move_up = *idx < layers_len - 1;
                                     if ui.add_sized([button_width, row_height], egui::Button::new("⏶").small().sense(if can_move_up { egui::Sense::click() } else { egui::Sense::hover() }))
+                                        .on_hover_text("Move layer up")
                                         .clicked() && can_move_up {
                                         move_up = Some(*idx);
                                     }
@@ -1440,12 +1445,15 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     // Column 4: Move down (fixed width)
                                     let can_move_down = *idx > 0;
                                     if ui.add_sized([button_width, row_height], egui::Button::new("⏷").small().sense(if can_move_down { egui::Sense::click() } else { egui::Sense::hover() }))
+                                        .on_hover_text("Move layer down")
                                         .clicked() && can_move_down {
                                         move_down = Some(*idx);
                                     }
 
                                     // Column 5: Delete (fixed width)
-                                    if ui.add_sized([button_width, row_height], egui::Button::new("×").small()).clicked() {
+                                    if ui.add_sized([button_width, row_height], egui::Button::new("×").small())
+                                        .on_hover_text("Delete layer")
+                                        .clicked() {
                                         state.context_menu_target = Some(ContextMenuTarget::Layer {
                                             layer_id,
                                             layer_name: layer_name.clone(),
@@ -2013,14 +2021,14 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                     // Character editor tab
                     if let Some(ref char_name) = state.active_character {
-                        ui.add_space(4.0);
+                        ui.add_space(2.0);
                         let is_editor = matches!(state.active_tab, ActiveTab::CharacterEditor(_));
                         if tab_button(ui, is_editor, format!("Edit Character: {}", char_name)).clicked() {
                             state.active_tab = ActiveTab::CharacterEditor(char_name.clone());
                         }
                     }
                 });
-                ui.add_space(-ui.spacing().item_spacing.y); // Remove margin between tabs and separator
+                ui.add_space(-ui.spacing().item_spacing.y - 2.0); // Remove margin between tabs and separator
                 ui.separator();
 
                 // Tab content
