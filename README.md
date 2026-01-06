@@ -3,7 +3,7 @@
 Pixel Sprite Studio is an animation tool for pixel art characters. You can organize character art for a single project together and composite animations from individual pieces (e.g. head, body, legs, sword, etc.)
 It might be useful for quick drafting (and then touch up by hand) or creating final, ready-to-use animations. You can then swap out pieces if you improve the art and just re-export all the animations at once!
 
-<img width="2003" height="1468" alt="image" src="https://github.com/user-attachments/assets/85d4e601-5b43-4519-b5b2-682bc63af050" />
+<img width="1442" height="833" alt="image" src="https://github.com/user-attachments/assets/af8b26d0-4ccc-41a8-90d5-10367aab46ea" />
 
 ## Features
 
