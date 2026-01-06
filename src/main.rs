@@ -58,9 +58,17 @@ fn default_ui_scale() -> f32 {
     1.0
 }
 
+/// Default margin for panel content (in virtual units, scaled by ui_scale)
+const DEFAULT_PANEL_MARGIN: f32 = 8.0;
+
 /// Get a scaled font size with minimum of 12
 fn scaled_font(base_size: f32, scale: f32) -> f32 {
     (base_size.max(12.0) * scale).max(12.0)
+}
+
+/// Get a scaled margin/spacing value
+fn scaled_margin(base_size: f32, scale: f32) -> f32 {
+    base_size * scale
 }
 
 /// Format a duration as a human-readable relative time string
@@ -87,9 +95,9 @@ fn format_relative_time(elapsed: std::time::Duration) -> String {
 }
 
 /// Render a tab-style button that looks distinct from regular selectable labels
-fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egui::Response {
+fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>, ui_scale: f32) -> egui::Response {
     let text = text.into();
-    let padding = egui::vec2(8.0, 4.0);
+    let padding = egui::vec2(scaled_margin(8.0, ui_scale), scaled_margin(4.0, ui_scale));
 
     let text_color = if selected {
         egui::Color32::WHITE
@@ -105,14 +113,22 @@ fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egu
 
     let galley = ui.painter().layout_no_wrap(
         text.clone(),
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(scaled_font(14.0, ui_scale)),
         text_color,
     );
 
-    let desired_size = galley.size() + padding * 2.0;
+    let tab_size = galley.size() + padding * 2.0;
+    // Selected: full height, lifted 1px to show stroke
+    // Deselected: 2px lower (partially hidden below separator)
+    let deselected_sink = 2.0;
+    let lift = 1.0;
+    let desired_size = egui::vec2(tab_size.x, tab_size.y + lift);
     let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
 
     if ui.is_rect_visible(rect) {
+        let y_offset = if selected { 0.0 } else { deselected_sink };
+        let draw_rect = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, y_offset), tab_size);
+
         let bg = if response.hovered() && !selected {
             egui::Color32::from_rgb(55, 65, 80)
         } else {
@@ -121,7 +137,7 @@ fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egu
 
         // Draw background with rounded top corners only
         ui.painter().rect_filled(
-            rect,
+            draw_rect,
             egui::Rounding {
                 nw: 4.0,
                 ne: 4.0,
@@ -132,21 +148,21 @@ fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egu
         );
 
         // Draw bottom border - bright for selected, dark gray for deselected
-        if selected {
-            ui.painter().line_segment(
-                [rect.left_bottom(), rect.right_bottom()],
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 140, 200)),
-            );
+        // Draw 1px up so the 2px stroke is fully inside the tab
+        let stroke_y = draw_rect.max.y - 1.0;
+        let stroke_color = if selected {
+            egui::Color32::from_rgb(100, 140, 200)
         } else {
-            ui.painter().line_segment(
-                [rect.left_bottom(), rect.right_bottom()],
-                egui::Stroke::new(2.0, egui::Color32::from_gray(40)),
-            );
-        }
+            egui::Color32::from_gray(40)
+        };
+        ui.painter().line_segment(
+            [egui::pos2(draw_rect.min.x, stroke_y), egui::pos2(draw_rect.max.x, stroke_y)],
+            egui::Stroke::new(2.0, stroke_color),
+        );
 
         // Draw text centered
         ui.painter().galley(
-            rect.min + padding,
+            draw_rect.min + padding,
             galley,
             text_color,
         );
@@ -818,9 +834,10 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
     render_dialogs(ctx, &mut state);
 
     // Menu bar
+    let menu_font_size = scaled_font(15.0, state.config.ui_scale);
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
         egui::menu::bar(ui, |ui| {
-            ui.menu_button(egui::RichText::new("File").size(15.0), |ui| {
+            ui.menu_button(egui::RichText::new("File").size(menu_font_size), |ui| {
                 if ui.button("New Project").clicked() {
                     if state.has_unsaved_changes() {
                         state.pending_action = Some(PendingAction::NewProject);
@@ -885,7 +902,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button(egui::RichText::new("Edit").size(15.0), |ui| {
+            ui.menu_button(egui::RichText::new("Edit").size(menu_font_size), |ui| {
                 if ui.button("Undo").clicked() {
                     ui.close_menu();
                 }
@@ -894,7 +911,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button(egui::RichText::new("View").size(15.0), |ui| {
+            ui.menu_button(egui::RichText::new("View").size(menu_font_size), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Zoom:");
                     egui::ComboBox::from_id_salt("zoom_level")
@@ -923,7 +940,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             });
 
             let has_project = state.project.is_some();
-            ui.menu_button(egui::RichText::new("Character").size(15.0), |ui| {
+            ui.menu_button(egui::RichText::new("Character").size(menu_font_size), |ui| {
                 if ui.add_enabled(has_project, egui::Button::new("New Character...")).clicked() {
                     state.show_new_character_dialog = true;
                     state.new_character_name.clear();
@@ -946,7 +963,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button(egui::RichText::new("Animation").size(15.0), |ui| {
+            ui.menu_button(egui::RichText::new("Animation").size(menu_font_size), |ui| {
                 if ui.add_enabled(has_project, egui::Button::new("New Animation...")).clicked() {
                     state.show_new_animation_dialog = true;
                     state.new_animation_name.clear();
@@ -977,7 +994,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button(egui::RichText::new("Export").size(15.0), |ui| {
+            ui.menu_button(egui::RichText::new("Export").size(menu_font_size), |ui| {
                 let has_animation = state.current_animation().map(|a| !a.frames.is_empty()).unwrap_or(false);
                 if ui.add_enabled(has_project && has_animation, egui::Button::new("Export Current Animation...")).clicked() {
                     if let Some(path) = pick_export_file() {
@@ -1038,14 +1055,19 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         .default_width(250.0)
         .min_width(200.0)
         .resizable(true)
+        .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(0.0))
         .show(ctx, |ui| {
             if let Some(ref project) = state.project.clone() {
-                // Character dropdown
-                ui.heading("Character");
+                // Character section as panel
+                egui::TopBottomPanel::top("character_section")
+                    .show_separator_line(true)
+                    .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                    .show_inside(ui, |ui| {
+                    ui.heading("Character");
                 let current_char_name = state.active_character.clone().unwrap_or_else(|| "(None)".to_string());
                 egui::ComboBox::from_id_salt("character_selector")
                     .selected_text(&current_char_name)
-                    .width(ui.available_width() - 10.0)
+                    .width((ui.available_width() - 10.0).max(10.0))
                     .show_ui(ui, |ui| {
                         for character in &project.characters {
                             let is_selected = state.active_character.as_ref() == Some(&character.name);
@@ -1090,10 +1112,15 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             state.show_delete_confirm_dialog = true;
                         }
                     });
+                } // end if active_char for action buttons
+                }); // end character_section panel
 
-                    ui.separator();
-
-                    // Animations list
+                // Animations section as panel
+                if let Some(ref active_char) = state.active_character.clone() {
+                egui::TopBottomPanel::top("animations_section")
+                    .show_separator_line(true)
+                    .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                    .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("Animations");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1159,20 +1186,18 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                 }
                             });
                     }
-                } else if project.characters.is_empty() {
-                    ui.label("No characters yet. Create one above.");
-                } else {
-                    ui.label("Select a character above.");
-                }
+                    }); // end animations_section panel
+                } // end if active_char for animations
 
-                // Parts Gallery - show when a character is active
+                // Parts Gallery section as panel
                 if let Some(ref active_char_name) = state.active_character.clone() {
                     if let Some(character) = project.get_character(&active_char_name) {
-                        ui.add_space(10.0);
-                        ui.separator();
+                egui::TopBottomPanel::top("parts_gallery_section")
+                    .show_separator_line(true)
+                    .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                    .show_inside(ui, |ui| {
                         ui.heading("Parts Gallery");
                         ui.label("(Drag to canvas)");
-                        ui.separator();
 
                         // Show parts with thumbnails in a grid
                         let gallery_parts: Vec<(String, String, Option<String>)> = character.parts.iter()
@@ -1187,11 +1212,13 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                         let char_id_for_gallery = character.id;
                         let char_name_for_gallery = active_char_name.clone();
-                        let gallery_size = 48.0;
-                        let items_per_row = ((ui.available_width() - 20.0) / (gallery_size + 8.0)).max(1.0) as usize;
+                        let ui_scale = state.config.ui_scale;
+                        let gallery_size = scaled_margin(48.0, ui_scale);
+                        let gallery_spacing = scaled_margin(8.0, ui_scale);
+                        let items_per_row = ((ui.available_width() - scaled_margin(20.0, ui_scale)) / (gallery_size + gallery_spacing)).max(1.0) as usize;
 
                         egui::Grid::new("parts_gallery_grid")
-                            .spacing([4.0, 4.0])
+                            .spacing([scaled_margin(4.0, ui_scale), scaled_margin(4.0, ui_scale)])
                             .show(ui, |ui| {
                                 for (idx, (part_name, state_name, thumb_data)) in gallery_parts.iter().enumerate() {
                                     let texture_key = format!("gallery/{}/{}", char_name_for_gallery, part_name);
@@ -1206,8 +1233,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     }
 
                                     // Draw gallery item
+                                    let label_height = scaled_margin(14.0, ui_scale);
                                     let (rect, response) = ui.allocate_exact_size(
-                                        egui::vec2(gallery_size, gallery_size + 14.0),
+                                        egui::vec2(gallery_size, gallery_size + label_height),
                                         egui::Sense::drag(),
                                     );
 
@@ -1287,10 +1315,8 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     }
                                 }
                             });
+                    }); // end parts_gallery_section panel
                     }
-                } else {
-                    ui.label("");
-                    ui.label("Select a character to see animations");
                 }
             }
         });
@@ -1303,14 +1329,20 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         .default_width(280.0)
         .min_width(200.0)
         .resizable(true)
+        .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(0.0))
         .show(ctx, |ui| {
-            ui.heading("Inspector");
-            ui.separator();
+            // Inspector section as panel
+            egui::TopBottomPanel::top("inspector_section")
+                .show_separator_line(true)
+                .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                .show_inside(ui, |ui| {
+                    ui.heading("Inspector");
 
             // Fixed-height container for inspector content
-            let inspector_height = 160.0;
+            let inspector_height = scaled_margin(160.0, state.config.ui_scale);
+            let available_width = ui.available_width().max(1.0); // Prevent negative width panic
             ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), inspector_height),
+                egui::vec2(available_width, inspector_height),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.set_min_height(inspector_height);
@@ -1408,11 +1440,14 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     }
                 },
             );
+                });
 
-            ui.separator();
-
-            // Layers panel - shows all placed parts in current frame
-            ui.heading("Layers");
+            // Layers section as panel
+            egui::TopBottomPanel::top("layers_section")
+                .show_separator_line(true)
+                .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                .show_inside(ui, |ui| {
+                    ui.heading("Layers");
 
             // Get layers for current frame (need to collect info for UI)
             // (id, name, index, visible, state_name, rotation)
@@ -1649,11 +1684,14 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     }
                 }
             }
+                });
 
-            ui.separator();
-
-            // Reference Image (per-frame)
-            ui.heading("Reference Image");
+            // Reference Image section as panel (fills remaining space)
+            egui::TopBottomPanel::top("reference_section")
+                .show_separator_line(true)
+                .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                .show_inside(ui, |ui| {
+                    ui.heading("Reference Image");
 
             // Extract needed values before mutable borrow
             let char_name = state.active_character.clone();
@@ -1833,112 +1871,117 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     }
                 }
             }
-        });
+        }); // end reference_section panel
+    }); // end right panel
     } // end right panel project check
 
     // Timeline (bottom panel) - only show on canvas tab when an animation is selected
     let is_canvas_tab = matches!(state.active_tab, ActiveTab::Canvas);
     if is_canvas_tab && state.current_animation().is_some() {
         let total_frames = state.total_frames();
+        let timeline_height = scaled_margin(120.0, state.config.ui_scale);
         egui::TopBottomPanel::bottom("timeline")
-            .exact_height(120.0)
+            .exact_height(timeline_height)
             .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Timeline");
+            // Timeline controls as proper panel with separator line
+            egui::TopBottomPanel::top("timeline_controls")
+                .show_separator_line(true)
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Timeline");
 
-                // Show current animation name if one is selected
-                if let Some(anim) = state.current_animation() {
-                    ui.separator();
-                    ui.label(&anim.name);
-                }
-
-                ui.separator();
-
-                // Playback controls
-                let play_text = if state.is_playing { "⏸" } else { "▶" };
-                let play_tooltip = if state.is_playing { "Pause (Enter)" } else { "Play (Enter)" };
-                if ui.button(play_text).on_hover_text(play_tooltip).clicked() {
-                    state.is_playing = !state.is_playing;
-                    if state.is_playing {
-                        state.playback_time = 0.0; // Reset timer when starting
-                        state.selected_part_id = None; // Deselect parts during playback
-                    }
-                }
-                // Ctrl+S (Cmd+S on Mac) saves the project
-                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
-                    if state.project_path.is_some() {
-                        match state.save_project() {
-                            Ok(()) => state.set_status("Project saved"),
-                            Err(e) => state.set_status(format!("Save failed: {}", e)),
+                        // Show current animation name if one is selected
+                        if let Some(anim) = state.current_animation() {
+                            ui.separator();
+                            ui.label(&anim.name);
                         }
-                    } else if let Some(path) = pick_save_file() {
-                        let path_str = path.to_string_lossy().to_string();
-                        match state.save_project_as(&path_str) {
-                            Ok(()) => state.set_status(format!("Saved to {}", path_str)),
-                            Err(e) => state.set_status(format!("Save failed: {}", e)),
+
+                        ui.separator();
+
+                        // Playback controls
+                        let play_text = if state.is_playing { "⏸" } else { "▶" };
+                        let play_tooltip = if state.is_playing { "Pause (Enter)" } else { "Play (Enter)" };
+                        if ui.button(play_text).on_hover_text(play_tooltip).clicked() {
+                            state.is_playing = !state.is_playing;
+                            if state.is_playing {
+                                state.playback_time = 0.0; // Reset timer when starting
+                                state.selected_part_id = None; // Deselect parts during playback
+                            }
                         }
-                    }
-                }
-                // Enter key toggles play/pause
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    state.is_playing = !state.is_playing;
-                    if state.is_playing {
-                        state.playback_time = 0.0;
-                        state.selected_part_id = None; // Deselect parts during playback
-                    }
-                }
-                // Delete key deletes selected part
-                if ui.input(|i| i.key_pressed(egui::Key::Delete)) && state.selected_part_id.is_some() {
-                    state.delete_selected_part();
-                    state.set_status("Part deleted");
-                }
-                // Left/Right arrow keys navigate frames with wrap-around
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && total_frames > 0 {
-                    state.current_frame = if state.current_frame == 0 {
-                        total_frames - 1
-                    } else {
-                        state.current_frame - 1
-                    };
-                    state.playback_time = 0.0;
-                    state.selected_part_id = None;
-                }
-                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) && total_frames > 0 {
-                    state.current_frame = (state.current_frame + 1) % total_frames;
-                    state.playback_time = 0.0;
-                    state.selected_part_id = None;
-                }
-                if ui.button("⏹").clicked() {
-                    state.is_playing = false;
-                    state.current_frame = 0;
-                    state.playback_time = 0.0;
-                }
-                if ui.button("⏮").clicked() && state.current_frame > 0 {
-                    state.current_frame -= 1;
-                    state.playback_time = 0.0;
-                    state.selected_part_id = None;
-                }
-                if ui.button("⏭").clicked() && state.current_frame < total_frames - 1 {
-                    state.current_frame += 1;
-                    state.playback_time = 0.0;
-                    state.selected_part_id = None;
-                }
+                        // Ctrl+S (Cmd+S on Mac) saves the project
+                        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                            if state.project_path.is_some() {
+                                match state.save_project() {
+                                    Ok(()) => state.set_status("Project saved"),
+                                    Err(e) => state.set_status(format!("Save failed: {}", e)),
+                                }
+                            } else if let Some(path) = pick_save_file() {
+                                let path_str = path.to_string_lossy().to_string();
+                                match state.save_project_as(&path_str) {
+                                    Ok(()) => state.set_status(format!("Saved to {}", path_str)),
+                                    Err(e) => state.set_status(format!("Save failed: {}", e)),
+                                }
+                            }
+                        }
+                        // Enter key toggles play/pause
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            state.is_playing = !state.is_playing;
+                            if state.is_playing {
+                                state.playback_time = 0.0;
+                                state.selected_part_id = None; // Deselect parts during playback
+                            }
+                        }
+                        // Delete key deletes selected part
+                        if ui.input(|i| i.key_pressed(egui::Key::Delete)) && state.selected_part_id.is_some() {
+                            state.delete_selected_part();
+                            state.set_status("Part deleted");
+                        }
+                        // Left/Right arrow keys navigate frames with wrap-around
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && total_frames > 0 {
+                            state.current_frame = if state.current_frame == 0 {
+                                total_frames - 1
+                            } else {
+                                state.current_frame - 1
+                            };
+                            state.playback_time = 0.0;
+                            state.selected_part_id = None;
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) && total_frames > 0 {
+                            state.current_frame = (state.current_frame + 1) % total_frames;
+                            state.playback_time = 0.0;
+                            state.selected_part_id = None;
+                        }
+                        if ui.button("⏹").clicked() {
+                            state.is_playing = false;
+                            state.current_frame = 0;
+                            state.playback_time = 0.0;
+                        }
+                        if ui.button("⏮").clicked() && state.current_frame > 0 {
+                            state.current_frame -= 1;
+                            state.playback_time = 0.0;
+                            state.selected_part_id = None;
+                        }
+                        if ui.button("⏭").clicked() && state.current_frame < total_frames - 1 {
+                            state.current_frame += 1;
+                            state.playback_time = 0.0;
+                            state.selected_part_id = None;
+                        }
 
-                ui.separator();
-                ui.label(format!("Frame: {} / {}", state.current_frame + 1, total_frames));
+                        ui.separator();
+                        ui.label(format!("Frame: {} / {}", state.current_frame + 1, total_frames));
 
-                ui.separator();
-                ui.label("FPS:");
-                let mut fps = state.current_animation().map(|a| a.fps).unwrap_or(12);
-                if ui.add(egui::DragValue::new(&mut fps).speed(0.1).range(1..=60)).changed() {
-                    if let Some(anim) = state.current_animation_mut() {
-                        anim.fps = fps;
-                    }
-                }
-            });
+                        ui.separator();
+                        ui.label("FPS:");
+                        let mut fps = state.current_animation().map(|a| a.fps).unwrap_or(12);
+                        if ui.add(egui::DragValue::new(&mut fps).speed(0.1).range(1..=60)).changed() {
+                            if let Some(anim) = state.current_animation_mut() {
+                                anim.fps = fps;
+                            }
+                        }
+                    });
+                });
 
-            ui.separator();
-
-            // Frame buttons
+            // Frame buttons fill remaining space
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let char_name = state.active_character.clone();
@@ -2019,22 +2062,24 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::ZERO))
         .show(ctx, |ui| {
         if state.project.is_none() {
+            let ui_scale = state.config.ui_scale;
             ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.label(egui::RichText::new("Welcome to Pixel Sprite Studio!").size(28.0).strong());
-                ui.label(egui::RichText::new("by Elle Trudgett").size(14.0).color(egui::Color32::GRAY));
+                ui.add_space(scaled_margin(40.0, ui_scale));
+                ui.label(egui::RichText::new("Welcome to Pixel Sprite Studio!").size(scaled_font(28.0, ui_scale)).strong());
+                ui.label(egui::RichText::new("by Elle Trudgett").size(scaled_font(14.0, ui_scale)).color(egui::Color32::GRAY));
                 ui.label(format!("v{}", VERSION));
-                ui.add_space(10.0);
+                ui.add_space(scaled_margin(10.0, ui_scale));
                 ui.label("Create or open a project to begin.");
-                ui.add_space(20.0);
+                ui.add_space(scaled_margin(20.0, ui_scale));
 
-                if ui.add(egui::Button::new(egui::RichText::new("New Project").size(18.0)).min_size(egui::vec2(160.0, 40.0))).clicked() {
+                let button_size = egui::vec2(scaled_margin(160.0, ui_scale), scaled_margin(40.0, ui_scale));
+                if ui.add(egui::Button::new(egui::RichText::new("New Project").size(scaled_font(18.0, ui_scale))).min_size(button_size)).clicked() {
                     state.new_project();
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(scaled_margin(10.0, ui_scale));
 
-                if ui.add(egui::Button::new(egui::RichText::new("Open Project...").size(18.0)).min_size(egui::vec2(160.0, 40.0))).clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("Open Project...").size(scaled_font(18.0, ui_scale))).min_size(button_size)).clicked() {
                     if let Some(path) = pick_open_file() {
                         let path_str = path.to_string_lossy().to_string();
                         match state.load_project(&path_str) {
@@ -2046,11 +2091,10 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                 // Recent Projects
                 let recent = state.config.recent_projects.clone();
-                let ui_scale = state.config.ui_scale;
                 if !recent.is_empty() {
-                    ui.add_space(30.0);
+                    ui.add_space(scaled_margin(30.0, ui_scale));
                     ui.heading("Recent Projects");
-                    ui.add_space(15.0);
+                    ui.add_space(scaled_margin(15.0, ui_scale));
 
                     let mut project_to_open: Option<String> = None;
                     let mut project_to_remove: Option<String> = None;
@@ -2139,7 +2183,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             button_rect.center(),
                             egui::Align2::CENTER_CENTER,
                             "×",
-                            egui::FontId::proportional(18.0),
+                            egui::FontId::proportional(scaled_font(18.0, ui_scale)),
                             visuals.text_color(),
                         );
                         if button_response.on_hover_text("Remove from recent").clicked() {
@@ -2187,67 +2231,74 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         } else {
             // Only show tabs if a character is selected
             if state.active_character.is_some() {
-                // Tab bar
-                ui.add_space(8.0); // Top margin
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0); // Left margin
-                    // Canvas tab
-                    let is_canvas = matches!(state.active_tab, ActiveTab::Canvas);
-                    if tab_button(ui, is_canvas, "Canvas").clicked() {
-                        state.active_tab = ActiveTab::Canvas;
-                    }
+                let ui_scale = state.config.ui_scale;
+                // Tab bar as proper panel
+                egui::TopBottomPanel::top("tab_bar")
+                    .show_separator_line(true)
+                    .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
+                        left: scaled_margin(16.0, ui_scale),
+                        right: scaled_margin(16.0, ui_scale),
+                        top: scaled_margin(8.0, ui_scale),
+                        bottom: 0.0
+                    }))
+                    .show_inside(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Canvas tab
+                            let is_canvas = matches!(state.active_tab, ActiveTab::Canvas);
+                            if tab_button(ui, is_canvas, "Canvas", ui_scale).clicked() {
+                                state.active_tab = ActiveTab::Canvas;
+                            }
 
-                    // Character editor tab
-                    if let Some(ref char_name) = state.active_character {
-                        ui.add_space(2.0);
-                        let is_editor = matches!(state.active_tab, ActiveTab::CharacterEditor(_));
-                        if tab_button(ui, is_editor, format!("Edit Character: {}", char_name)).clicked() {
-                            state.active_tab = ActiveTab::CharacterEditor(char_name.clone());
-                        }
-                    }
-                });
-                ui.add_space(-ui.spacing().item_spacing.y - 2.0); // Remove margin between tabs and separator
-                ui.separator();
+                            // Character editor tab
+                            if let Some(ref char_name) = state.active_character {
+                                ui.add_space(scaled_margin(2.0, ui_scale));
+                                let is_editor = matches!(state.active_tab, ActiveTab::CharacterEditor(_));
+                                if tab_button(ui, is_editor, format!("Edit Character: {}", char_name), ui_scale).clicked() {
+                                    state.active_tab = ActiveTab::CharacterEditor(char_name.clone());
+                                }
+                            }
+                        });
+                    });
 
                 // Tab content
                 match &state.active_tab {
                     ActiveTab::Canvas => {
-                        // View options bar (horizontal, under tabs)
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0); // Left margin
-                            ui.heading("View");
-                            ui.separator();
-                            ui.label("Zoom:");
-                            egui::ComboBox::from_id_salt("zoom_level_canvas")
-                                .selected_text(format_zoom(state.zoom_level))
-                                .width(50.0)
-                                .show_ui(ui, |ui| {
-                                    for &level in &ZOOM_LEVELS {
-                                        ui.selectable_value(&mut state.zoom_level, level, format_zoom(level));
-                                    }
+                        // View options bar as proper panel
+                        egui::TopBottomPanel::top("view_options")
+                            .show_separator_line(true)
+                            .show_inside(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.heading("View");
+                                    ui.separator();
+                                    ui.label("Zoom:");
+                                    egui::ComboBox::from_id_salt("zoom_level_canvas")
+                                        .selected_text(format_zoom(state.zoom_level))
+                                        .width(50.0)
+                                        .show_ui(ui, |ui| {
+                                            for &level in &ZOOM_LEVELS {
+                                                ui.selectable_value(&mut state.zoom_level, level, format_zoom(level));
+                                            }
+                                        });
+                                    ui.label("Show:");
+                                    ui.checkbox(&mut state.show_grid, "Grid");
+                                    ui.checkbox(&mut state.show_labels, "Labels");
+
+                                    ui.separator();
+                                    ui.heading("Reference image");
+                                    ui.separator();
+                                    ui.label("Alpha:");
+                                    let mut alpha_percent = (state.reference_opacity * 10.0).round() as i32;
+                                    ui.add_sized([60.0, 18.0], egui::Slider::new(&mut alpha_percent, 0..=10).show_value(false));
+                                    state.reference_opacity = alpha_percent as f32 / 10.0;
+                                    ui.label(format!("{}%", alpha_percent * 10));
+                                    ui.checkbox(&mut state.reference_show_on_top, "On top");
                                 });
-                            ui.label("Show:");
-                            ui.checkbox(&mut state.show_grid, "Grid");
-                            ui.checkbox(&mut state.show_labels, "Labels");
+                            });
 
-                            ui.separator();
-                            ui.heading("Reference image");
-                            ui.separator();
-                            ui.label("Alpha:");
-                            let mut alpha_percent = (state.reference_opacity * 10.0).round() as i32;
-                            ui.add_sized([60.0, 18.0], egui::Slider::new(&mut alpha_percent, 0..=10).show_value(false));
-                            state.reference_opacity = alpha_percent as f32 / 10.0;
-                            ui.label(format!("{}%", alpha_percent * 10));
-                            ui.checkbox(&mut state.reference_show_on_top, "On top");
-                        });
-                        ui.separator();
-
-                        // Dark background for canvas area - negative outer_margin extends fill to panel edges
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_gray(10))
-                            .outer_margin(egui::Margin { left: -8.0, right: -8.0, top: -5.0, bottom: -8.0 })
-                            .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 6.0, bottom: 8.0 })
-                            .show(ui, |ui| {
+                        // Canvas area fills remaining space
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::none().fill(egui::Color32::from_gray(10)))
+                            .show_inside(ui, |ui| {
                                 render_canvas(ui, &mut state);
                             });
                     }
@@ -3073,9 +3124,13 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             );
         }
 
-        // Draw selection border (yellow) or label border (red) - on top of labels
+        // Draw selection border (pulsating yellow) or label border (red) - on top of labels
         if is_selected {
-            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+            let t = ui.ctx().input(|i| i.time);
+            let alpha = (0.6 + 0.4 * (6.0 * t).sin()) as f32;
+            let yellow = egui::Color32::from_rgba_unmultiplied(255, 255, 0, (alpha * 255.0) as u8);
+            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, yellow));
+            ui.ctx().request_repaint(); // Keep animating
         } else if show_labels {
             painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::RED));
         }
