@@ -254,7 +254,7 @@ fn main() {
         .add_plugins(EguiPlugin)
         .init_resource::<AppState>()
         .add_systems(Startup, (setup, configure_fonts))
-        .add_systems(Update, (ui_system, handle_window_close))
+        .add_systems(Update, (ui_system, handle_window_close, update_window_title))
         .run();
 }
 
@@ -808,8 +808,65 @@ fn handle_window_close(
     }
 }
 
+fn update_window_title(
+    state: Res<AppState>,
+    mut windows: Query<&mut Window>,
+) {
+    let base_title = format!("Pixel Sprite Studio v{}", VERSION);
+    let new_title = if let Some(ref project) = state.project {
+        let project_name = if project.name.is_empty() || project.name == "Untitled" {
+            None
+        } else {
+            Some(project.name.as_str())
+        };
+        match project_name {
+            Some(name) => format!("{} - {}", base_title, name),
+            None => base_title,
+        }
+    } else {
+        base_title
+    };
+
+    for mut window in windows.iter_mut() {
+        if window.title != new_title {
+            window.title = new_title.clone();
+        }
+    }
+}
+
 fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<Time>) {
     let ctx = contexts.ctx_mut();
+
+    // Apply UI scale to global text styles and spacing
+    let ui_scale = state.config.ui_scale;
+    let mut style = (*ctx.style()).clone();
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::proportional(scaled_font(20.0, ui_scale)),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::proportional(scaled_font(14.0, ui_scale)),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::proportional(scaled_font(14.0, ui_scale)),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::proportional(scaled_font(12.0, ui_scale)),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(scaled_font(14.0, ui_scale)),
+    );
+    // Scale checkbox/radio button sizes
+    style.spacing.icon_width = scaled_margin(14.0, ui_scale);
+    style.spacing.icon_width_inner = scaled_margin(8.0, ui_scale);
+    style.spacing.icon_spacing = scaled_margin(4.0, ui_scale);
+    // Prevent text wrapping in menus
+    style.wrap_mode = Some(egui::TextWrapMode::Extend);
+    ctx.set_style(style);
 
     // Handle animation playback
     if state.is_playing {
@@ -913,23 +970,15 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
             ui.menu_button(egui::RichText::new("View").size(menu_font_size), |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Zoom:");
-                    egui::ComboBox::from_id_salt("zoom_level")
-                        .selected_text(format_zoom(state.zoom_level))
-                        .show_ui(ui, |ui| {
-                            for &level in &ZOOM_LEVELS {
-                                let label = format_zoom(level);
-                                if ui.selectable_value(&mut state.zoom_level, level, &label).clicked() {
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
                     ui.label("UI Scale:");
-                    let old_scale = state.config.ui_scale;
-                    ui.add(egui::Slider::new(&mut state.config.ui_scale, 0.75..=2.0).step_by(0.25));
-                    if state.config.ui_scale != old_scale {
+                    let button_size = scaled_margin(20.0, state.config.ui_scale);
+                    if ui.add_sized([button_size, button_size], egui::Button::new("−")).clicked() && state.config.ui_scale > 0.75 {
+                        state.config.ui_scale = (state.config.ui_scale - 0.25).max(0.75);
+                        state.config.save();
+                    }
+                    ui.label(format!("{:.0}%", state.config.ui_scale * 100.0));
+                    if ui.add_sized([button_size, button_size], egui::Button::new("+")).clicked() && state.config.ui_scale < 2.0 {
+                        state.config.ui_scale = (state.config.ui_scale + 0.25).min(2.0);
                         state.config.save();
                     }
                 });
@@ -1050,14 +1099,35 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
     // Asset browser (left panel) - Simplified: flat character list + animations
     // Only show when a project is loaded
+    // Limit panel widths to ensure at least 25% of screen remains for canvas
+    let screen_width = ctx.screen_rect().width();
+    let max_panel_width = screen_width * 0.375; // Each panel can take at most 37.5%, leaving 25% for canvas
     if state.project.is_some() {
     egui::SidePanel::left("asset_browser")
-        .default_width(250.0)
-        .min_width(200.0)
+        .default_width(scaled_margin(250.0, ui_scale))
+        .min_width(scaled_margin(200.0, ui_scale))
+        .max_width(max_panel_width)
         .resizable(true)
         .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(0.0))
         .show(ctx, |ui| {
             if let Some(ref project) = state.project.clone() {
+                // Project section as panel
+                egui::TopBottomPanel::top("project_section")
+                    .show_separator_line(true)
+                    .frame(egui::Frame::none().inner_margin(scaled_margin(DEFAULT_PANEL_MARGIN, state.config.ui_scale)))
+                    .show_inside(ui, |ui| {
+                        ui.heading("Project");
+                        ui.horizontal(|ui| {
+                            ui.label("Name:");
+                            let mut name = project.name.clone();
+                            if ui.text_edit_singleline(&mut name).changed() {
+                                if let Some(ref mut p) = state.project {
+                                    p.name = name;
+                                }
+                            }
+                        });
+                    });
+
                 // Character section as panel
                 egui::TopBottomPanel::top("character_section")
                     .show_separator_line(true)
@@ -1126,7 +1196,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Use available height (matched to heading) for both dimensions to make it square
                             let size = ui.available_height();
-                            if ui.add(egui::Button::new(egui::RichText::new("+").strong().size(16.0)).min_size(egui::vec2(size, size)))
+                            if ui.add(egui::Button::new(egui::RichText::new("+").strong().size(scaled_font(16.0, state.config.ui_scale))).min_size(egui::vec2(size, size)))
                                 .on_hover_text("New animation")
                                 .clicked() {
                                 state.show_new_animation_dialog = true;
@@ -1326,8 +1396,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
     // Only show when a project is loaded
     if state.project.is_some() {
     egui::SidePanel::right("inspector")
-        .default_width(280.0)
-        .min_width(200.0)
+        .default_width(scaled_margin(280.0, ui_scale))
+        .min_width(scaled_margin(200.0, ui_scale))
+        .max_width(max_panel_width)
         .resizable(true)
         .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(0.0))
         .show(ctx, |ui| {
@@ -1480,21 +1551,22 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             } else {
                 let available_width = ui.available_width();
                 let layers_len = layers.len();
-                // Calculate fixed widths for buttons
-                let button_width = 22.0;
-                let buttons_total = button_width * 4.0 + 16.0; // 4 buttons + spacing
-                let name_width = (available_width - 8.0 - buttons_total).max(50.0);
+                let ui_scale = state.config.ui_scale;
+                // Calculate fixed widths for buttons (scaled)
+                let button_width = scaled_margin(22.0, ui_scale);
+                let buttons_total = button_width * 4.0 + scaled_margin(16.0, ui_scale); // 4 buttons + spacing
+                let name_width = (available_width - scaled_margin(8.0, ui_scale) - buttons_total).max(scaled_margin(50.0, ui_scale));
 
                 egui::Frame::none()
                     .fill(egui::Color32::from_gray(35))
-                    .rounding(4.0)
-                    .inner_margin(4.0)
+                    .rounding(scaled_margin(4.0, ui_scale))
+                    .inner_margin(scaled_margin(4.0, ui_scale))
                     .show(ui, |ui| {
-                        ui.set_width(available_width - 8.0);
+                        ui.set_width(available_width - scaled_margin(8.0, ui_scale));
                         egui::Grid::new("layers_grid")
                             .num_columns(7)
                             .min_col_width(0.0)
-                            .spacing([4.0, 2.0])
+                            .spacing([scaled_margin(4.0, ui_scale), scaled_margin(2.0, ui_scale)])
                             .show(ui, |ui| {
                                 for (id, name, idx, visible, state_name, rotation) in layers.iter().rev() {
                                     let is_selected = state.selected_part_id == Some(*id);
@@ -1518,7 +1590,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                         egui::RichText::new(name.as_str())
                                     };
                                     let response = ui.add_sized(
-                                        [name_width - 80.0, row_height],
+                                        [(name_width - scaled_margin(80.0, ui_scale)).max(1.0), row_height],
                                         egui::SelectableLabel::new(is_selected, label),
                                     );
                                     if response.clicked() {
@@ -1539,8 +1611,8 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     // Column 3: State name badge (blue background)
                                     let state_badge = egui::Frame::none()
                                         .fill(egui::Color32::from_rgb(50, 80, 130))
-                                        .rounding(3.0)
-                                        .inner_margin(egui::Margin::symmetric(4.0, 1.0));
+                                        .rounding(scaled_margin(3.0, ui_scale))
+                                        .inner_margin(egui::Margin::symmetric(scaled_margin(4.0, ui_scale), scaled_margin(1.0, ui_scale)));
                                     state_badge.show(ui, |ui| {
                                         ui.label(egui::RichText::new(state_name).small().color(egui::Color32::WHITE));
                                     });
@@ -1548,8 +1620,8 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     // Column 4: Rotation badge (green background)
                                     let rot_badge = egui::Frame::none()
                                         .fill(egui::Color32::from_rgb(50, 100, 60))
-                                        .rounding(3.0)
-                                        .inner_margin(egui::Margin::symmetric(4.0, 1.0));
+                                        .rounding(scaled_margin(3.0, ui_scale))
+                                        .inner_margin(egui::Margin::symmetric(scaled_margin(4.0, ui_scale), scaled_margin(1.0, ui_scale)));
                                     rot_badge.show(ui, |ui| {
                                         ui.label(egui::RichText::new(format!("{}°", rotation)).small().color(egui::Color32::WHITE));
                                     });
@@ -2068,24 +2140,29 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 ui.label(egui::RichText::new("Welcome to Pixel Sprite Studio!").size(scaled_font(28.0, ui_scale)).strong());
                 ui.label(egui::RichText::new("by Elle Trudgett").size(scaled_font(14.0, ui_scale)).color(egui::Color32::GRAY));
                 ui.label(format!("v{}", VERSION));
-                ui.add_space(scaled_margin(10.0, ui_scale));
-                ui.label("Create or open a project to begin.");
                 ui.add_space(scaled_margin(20.0, ui_scale));
 
                 let button_size = egui::vec2(scaled_margin(160.0, ui_scale), scaled_margin(40.0, ui_scale));
-                if ui.add(egui::Button::new(egui::RichText::new("New Project").size(scaled_font(18.0, ui_scale))).min_size(button_size)).clicked() {
-                    state.new_project();
-                }
-
-                ui.add_space(scaled_margin(10.0, ui_scale));
-
-                if ui.add(egui::Button::new(egui::RichText::new("Open Project...").size(scaled_font(18.0, ui_scale))).min_size(button_size)).clicked() {
-                    if let Some(path) = pick_open_file() {
-                        let path_str = path.to_string_lossy().to_string();
-                        match state.load_project(&path_str) {
-                            Ok(()) => state.set_status(format!("Loaded {}", path_str)),
-                            Err(e) => state.set_status(format!("Load failed: {}", e)),
+                let mut open_project_path: Option<String> = None;
+                // Center the button row
+                let total_buttons_width = button_size.x * 2.0 + scaled_margin(10.0, ui_scale);
+                let available = ui.available_width();
+                ui.horizontal(|ui| {
+                    ui.add_space(((available - total_buttons_width) / 2.0).max(0.0));
+                    if ui.add(egui::Button::new(egui::RichText::new("New Project").size(scaled_font(18.0, ui_scale))).min_size(button_size)).clicked() {
+                        state.new_project();
+                    }
+                    ui.add_space(scaled_margin(10.0, ui_scale));
+                    if ui.add(egui::Button::new(egui::RichText::new("Open Project...").size(scaled_font(18.0, ui_scale))).min_size(button_size)).clicked() {
+                        if let Some(path) = pick_open_file() {
+                            open_project_path = Some(path.to_string_lossy().to_string());
                         }
+                    }
+                });
+                if let Some(path_str) = open_project_path {
+                    match state.load_project(&path_str) {
+                        Ok(()) => state.set_status(format!("Loaded {}", path_str)),
+                        Err(e) => state.set_status(format!("Load failed: {}", e)),
                     }
                 }
 
@@ -2114,16 +2191,24 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             .map(format_relative_time)
                             .unwrap_or_else(|| "unknown".to_string());
 
-                        // Try to read project to get character names
-                        let characters: Vec<String> = std::fs::read_to_string(&path_buf)
+                        // Try to read project to get name and character names
+                        let loaded_project = std::fs::read_to_string(&path_buf)
                             .ok()
-                            .and_then(|json| Project::from_json(&json).ok())
+                            .and_then(|json| Project::from_json(&json).ok());
+                        let project_name = loaded_project.as_ref()
+                            .map(|p| p.name.clone())
+                            .filter(|n| !n.is_empty() && n != "Untitled");
+                        let characters: Vec<String> = loaded_project
                             .map(|p| p.characters.iter().map(|c| c.name.clone()).collect())
                             .unwrap_or_default();
+                        // Use project name if available, otherwise filename
+                        let display_name = project_name.unwrap_or_else(|| filename.clone());
 
                         // Card frame - center with spacers
                         // Estimate card width for centering (path is usually the widest element)
-                        let estimated_card_width = (path.len() as f32 * 7.0).max(300.0);
+                        let char_width = scaled_margin(7.0, ui_scale);
+                        let min_card_width = scaled_margin(300.0, ui_scale);
+                        let estimated_card_width = (path.len() as f32 * char_width).max(min_card_width);
                         let card_response = ui.horizontal(|ui| {
                             // Left spacer - center the card by accounting for its width
                             let available = ui.available_width();
@@ -2131,12 +2216,12 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                             let frame_response = egui::Frame::none()
                                 .fill(egui::Color32::from_rgb(45, 45, 55))
-                                .rounding(8.0)
-                                .inner_margin(12.0)
+                                .rounding(scaled_margin(8.0, ui_scale))
+                                .inner_margin(scaled_margin(12.0, ui_scale))
                                 .show(ui, |ui| {
                                     // Explicit vertical layout for contents
                                     ui.vertical(|ui| {
-                                        ui.heading(&filename);
+                                        ui.heading(&display_name);
 
                                         ui.label(
                                             egui::RichText::new(&modified_ago)
@@ -2152,7 +2237,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                                         // Characters list
                                         if !characters.is_empty() {
-                                            ui.add_space(8.0);
+                                            ui.add_space(scaled_margin(8.0, ui_scale));
                                             ui.label(egui::RichText::new("Characters:").size(scaled_font(12.0, ui_scale)).strong());
                                             for char_name in &characters {
                                                 ui.label(egui::RichText::new(format!("• {}", char_name)).size(scaled_font(12.0, ui_scale)));
@@ -2796,8 +2881,8 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     );
 
     // Fit/Center button in top-right corner
-    let button_size = 24.0;
-    let button_margin = 8.0;
+    let button_size = scaled_margin(24.0, state.config.ui_scale);
+    let button_margin = scaled_margin(8.0, state.config.ui_scale);
     let button_rect = egui::Rect::from_min_size(
         egui::pos2(
             response.rect.max.x - button_size - button_margin,
@@ -2807,7 +2892,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     );
     let fit_button = ui.put(
         button_rect,
-        egui::Button::new(egui::RichText::new("⊙").size(16.0))
+        egui::Button::new(egui::RichText::new("⊙").size(scaled_font(16.0, state.config.ui_scale)))
             .min_size(egui::vec2(button_size, button_size)),
     );
     if fit_button.on_hover_text("Fit canvas to view and center").clicked() {
