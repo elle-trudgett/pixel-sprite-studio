@@ -10,11 +10,41 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 const MAX_RECENT_PROJECTS: usize = 10;
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(target_os = "windows")]
 use rfd::FileDialog;
 
-const ZOOM_LEVELS: [f32; 10] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+const ZOOM_LEVELS: [f32; 14] = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0, 128.0];
+
+/// Format zoom level: integers show as "16x", fractional as "0.25x"
+fn format_zoom(level: f32) -> String {
+    if level.fract() == 0.0 {
+        format!("{}x", level as i32)
+    } else {
+        format!("{}x", level)
+    }
+}
+
+/// Calculate the best zoom level to fit the canvas in the available area
+fn calculate_fit_zoom(canvas_size: (u32, u32), available: egui::Vec2, ppp: f32) -> f32 {
+    // Find the largest zoom level where the canvas fits in the available area
+    // Account for some padding (90% of available space)
+    let padded_w = available.x * 0.9;
+    let padded_h = available.y * 0.9;
+
+    // Calculate max zoom for each dimension
+    let max_zoom_w = (padded_w * ppp) / canvas_size.0 as f32;
+    let max_zoom_h = (padded_h * ppp) / canvas_size.1 as f32;
+    let max_zoom = max_zoom_w.min(max_zoom_h);
+
+    // Find the largest ZOOM_LEVEL that's <= max_zoom
+    ZOOM_LEVELS.iter()
+        .rev()
+        .find(|&&level| level <= max_zoom)
+        .copied()
+        .unwrap_or(ZOOM_LEVELS[0])
+}
 
 /// App configuration stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,8 +64,7 @@ fn scaled_font(base_size: f32, scale: f32) -> f32 {
 }
 
 /// Format a duration as a human-readable relative time string
-fn format_relative_time(instant: std::time::Instant) -> String {
-    let elapsed = instant.elapsed();
+fn format_relative_time(elapsed: std::time::Duration) -> String {
     let secs = elapsed.as_secs();
 
     if secs < 3 {
@@ -102,11 +131,16 @@ fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egu
             bg,
         );
 
-        // Draw bottom border for selected tab
+        // Draw bottom border - bright for selected, dark gray for deselected
         if selected {
             ui.painter().line_segment(
                 [rect.left_bottom(), rect.right_bottom()],
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 140, 200)),
+            );
+        } else {
+            ui.painter().line_segment(
+                [rect.left_bottom(), rect.right_bottom()],
+                egui::Stroke::new(2.0, egui::Color32::from_gray(40)),
             );
         }
 
@@ -193,7 +227,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Pixel Sprite Studio".into(),
+                title: format!("Pixel Sprite Studio v{}", VERSION),
                 resolution: (1920., 1080.).into(),
                 resizable: true,
                 ..default()
@@ -238,10 +272,13 @@ struct AppState {
     is_playing: bool,
     playback_time: f32, // Accumulated time in current frame (seconds)
     selected_part_id: Option<u64>,
+    selection_time: Option<std::time::Instant>, // When part was selected (for flash effect)
+    last_clicked_part_id: Option<u64>, // Track part clicked for double-click validation
     pixel_aligned: bool,
     canvas_offset: (f32, f32), // Pan offset for canvas
     is_panning: bool, // True when space or middle mouse is held
     pan_started_in_canvas: bool, // True if panning was initiated with mouse inside canvas
+    needs_zoom_fit: bool, // True when zoom should auto-fit to canvas size
 
     // Per-character animation state
     active_character: Option<String>, // Currently selected character
@@ -312,14 +349,15 @@ struct AppState {
 
 #[derive(Clone)]
 struct DraggedPart {
-    character_name: String,
+    character_id: u64,
     part_name: String,
     state_name: String,
 }
 
 #[derive(Clone)]
 struct GalleryDrag {
-    character_name: String,
+    character_id: u64,
+    character_name: String, // Kept for texture cache keys
     part_name: String,
     state_name: String,
 }
@@ -351,10 +389,13 @@ impl AppState {
             is_playing: false,
             playback_time: 0.0,
             selected_part_id: None,
+            selection_time: None,
+            last_clicked_part_id: None,
             pixel_aligned: true,
             canvas_offset: (0.0, 0.0),
             is_panning: false,
             pan_started_in_canvas: false,
+            needs_zoom_fit: true,
             active_character: None,
             active_tab: ActiveTab::Canvas,
             editor_selected_part: None,
@@ -398,7 +439,7 @@ impl AppState {
         }
     }
 
-    fn place_part_on_canvas(&mut self, character: &str, part: &str, state: &str, x: f32, y: f32) {
+    fn place_part_on_canvas(&mut self, character_id: u64, part: &str, state: &str, x: f32, y: f32) {
         let current_anim = self.current_animation;
         let current_frame = self.current_frame;
         let char_name = self.active_character.clone();
@@ -451,7 +492,7 @@ impl AppState {
                 part.to_string()
             };
 
-            let mut placed = PlacedPart::new(id, character, part, state)
+            let mut placed = PlacedPart::new(id, character_id, part, state)
                 .with_layer_name(&layer_name);
             placed.position = (x, y);
 
@@ -461,6 +502,7 @@ impl AppState {
                         if let Some(frame) = anim.frames.get_mut(current_frame) {
                             frame.placed_parts.push(placed);
                             self.selected_part_id = Some(id);
+                            self.selection_time = Some(std::time::Instant::now());
                         }
                     }
                 }
@@ -571,6 +613,7 @@ impl AppState {
         self.project = Some(project);
         self.project_path = Some(PathBuf::from(path));
         self.selected_part_id = None;
+        self.needs_zoom_fit = true;
         self.config.add_recent(path);
 
         Ok(())
@@ -586,6 +629,7 @@ impl AppState {
         self.current_frame = 0;
         self.selected_part_id = None;
         self.active_character = None;
+        self.needs_zoom_fit = true;
     }
 
     fn close_project(&mut self) {
@@ -776,7 +820,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
     // Menu bar
     egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
         egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
+            ui.menu_button(egui::RichText::new("File").size(15.0), |ui| {
                 if ui.button("New Project").clicked() {
                     if state.has_unsaved_changes() {
                         state.pending_action = Some(PendingAction::NewProject);
@@ -841,7 +885,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button("Edit", |ui| {
+            ui.menu_button(egui::RichText::new("Edit").size(15.0), |ui| {
                 if ui.button("Undo").clicked() {
                     ui.close_menu();
                 }
@@ -850,14 +894,14 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button("View", |ui| {
+            ui.menu_button(egui::RichText::new("View").size(15.0), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Zoom:");
                     egui::ComboBox::from_id_salt("zoom_level")
-                        .selected_text(format!("{:.2}x", state.zoom_level))
+                        .selected_text(format_zoom(state.zoom_level))
                         .show_ui(ui, |ui| {
                             for &level in &ZOOM_LEVELS {
-                                let label = format!("{:.2}x", level);
+                                let label = format_zoom(level);
                                 if ui.selectable_value(&mut state.zoom_level, level, &label).clicked() {
                                     ui.close_menu();
                                 }
@@ -879,7 +923,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             });
 
             let has_project = state.project.is_some();
-            ui.menu_button("Character", |ui| {
+            ui.menu_button(egui::RichText::new("Character").size(15.0), |ui| {
                 if ui.add_enabled(has_project, egui::Button::new("New Character...")).clicked() {
                     state.show_new_character_dialog = true;
                     state.new_character_name.clear();
@@ -902,7 +946,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button("Animation", |ui| {
+            ui.menu_button(egui::RichText::new("Animation").size(15.0), |ui| {
                 if ui.add_enabled(has_project, egui::Button::new("New Animation...")).clicked() {
                     state.show_new_animation_dialog = true;
                     state.new_animation_name.clear();
@@ -933,7 +977,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             });
 
-            ui.menu_button("Export", |ui| {
+            ui.menu_button(egui::RichText::new("Export").size(15.0), |ui| {
                 let has_animation = state.current_animation().map(|a| !a.frames.is_empty()).unwrap_or(false);
                 if ui.add_enabled(has_project && has_animation, egui::Button::new("Export Current Animation...")).clicked() {
                     if let Some(path) = pick_export_file() {
@@ -974,15 +1018,22 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some((ref msg, ref when)) = state.status_message {
-                    let relative_time = format_relative_time(*when);
+                    let relative_time = format_relative_time(when.elapsed());
                     ui.label(format!("{} ({})", msg, relative_time));
                 } else {
                     ui.label("Ready");
                 }
+
+                // Version number floating right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("v{}", VERSION));
+                });
             });
         });
 
     // Asset browser (left panel) - Simplified: flat character list + animations
+    // Only show when a project is loaded
+    if state.project.is_some() {
     egui::SidePanel::left("asset_browser")
         .default_width(250.0)
         .min_width(200.0)
@@ -1004,6 +1055,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                 state.editor_selected_state = None;
                                 state.current_animation = 0;
                                 state.current_frame = 0;
+                                state.needs_zoom_fit = true;
                             }
                         }
                         ui.separator();
@@ -1133,6 +1185,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             })
                             .collect();
 
+                        let char_id_for_gallery = character.id;
                         let char_name_for_gallery = active_char_name.clone();
                         let gallery_size = 48.0;
                         let items_per_row = ((ui.available_width() - 20.0) / (gallery_size + 8.0)).max(1.0) as usize;
@@ -1221,6 +1274,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                     // Handle drag start
                                     if response.drag_started() {
                                         state.gallery_drag = Some(GalleryDrag {
+                                            character_id: char_id_for_gallery,
                                             character_name: char_name_for_gallery.clone(),
                                             part_name: part_name.clone(),
                                             state_name: state_name.clone(),
@@ -1240,8 +1294,11 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             }
         });
+    } // end left panel project check
 
     // Inspector (right panel)
+    // Only show when a project is loaded
+    if state.project.is_some() {
     egui::SidePanel::right("inspector")
         .default_width(280.0)
         .min_width(200.0)
@@ -1260,13 +1317,13 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
                     // Show selected part properties
                     let selected_info = state.get_selected_placed_part().map(|p| {
-                        (p.character_name.clone(), p.part_name.clone(), p.state_name.clone(), p.position, p.rotation, p.z_override)
+                        (p.character_id, p.part_name.clone(), p.state_name.clone(), p.position, p.rotation, p.z_override)
                     });
 
                     // Get available states for the selected part
-                    let available_states: Vec<String> = if let Some((ref char_name, ref part_name, _, _, _, _)) = selected_info {
+                    let available_states: Vec<String> = if let Some((character_id, ref part_name, _, _, _, _)) = selected_info {
                         state.project.as_ref()
-                            .and_then(|p| p.get_character(char_name))
+                            .and_then(|p| p.get_character_by_id(character_id))
                             .and_then(|c| c.get_part(part_name))
                             .map(|p| p.states.iter().map(|s| s.name.clone()).collect())
                             .unwrap_or_default()
@@ -1274,7 +1331,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         vec![]
                     };
 
-                    if let Some((_character_name, part_name, current_state, position, rotation, _z_override)) = selected_info {
+                    if let Some((_character_id, part_name, current_state, position, rotation, _z_override)) = selected_info {
                         ui.label(format!("Selected layer: {}", part_name));
                         ui.separator();
 
@@ -1358,12 +1415,19 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             ui.heading("Layers");
 
             // Get layers for current frame (need to collect info for UI)
-            // (id, name, index, visible)
-            let layers: Vec<(u64, String, usize, bool)> = {
+            // (id, name, index, visible, state_name, rotation)
+            let layers: Vec<(u64, String, usize, bool, String, u16)> = {
                 if let Some(anim) = state.current_animation() {
                     if let Some(frame) = anim.frames.get(state.current_frame) {
                         frame.placed_parts.iter().enumerate()
-                            .map(|(idx, p)| (p.id, if p.layer_name.is_empty() { p.part_name.clone() } else { p.layer_name.clone() }, idx, p.visible))
+                            .map(|(idx, p)| (
+                                p.id,
+                                if p.layer_name.is_empty() { p.part_name.clone() } else { p.layer_name.clone() },
+                                idx,
+                                p.visible,
+                                p.state_name.clone(),
+                                p.rotation,
+                            ))
                             .collect()
                     } else { vec![] }
                 } else { vec![] }
@@ -1372,6 +1436,8 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             // Show layers in reverse order (top layer first in UI)
             let mut move_up: Option<usize> = None;
             let mut move_down: Option<usize> = None;
+            let mut move_to_top: Option<usize> = None;
+            let mut move_to_bottom: Option<usize> = None;
             let mut toggle_visibility: Option<usize> = None;
 
             if layers.is_empty() {
@@ -1391,11 +1457,11 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     .show(ui, |ui| {
                         ui.set_width(available_width - 8.0);
                         egui::Grid::new("layers_grid")
-                            .num_columns(5)
+                            .num_columns(7)
                             .min_col_width(0.0)
                             .spacing([4.0, 2.0])
                             .show(ui, |ui| {
-                                for (id, name, idx, visible) in layers.iter().rev() {
+                                for (id, name, idx, visible, state_name, rotation) in layers.iter().rev() {
                                     let is_selected = state.selected_part_id == Some(*id);
                                     let layer_id = *id;
                                     let layer_name = name.clone();
@@ -1410,18 +1476,19 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                         toggle_visibility = Some(*idx);
                                     }
 
-                                    // Column 2: Layer name (takes remaining space)
+                                    // Column 2: Layer name (takes most of space)
                                     let label = if is_selected {
                                         egui::RichText::new(name.as_str()).strong()
                                     } else {
                                         egui::RichText::new(name.as_str())
                                     };
                                     let response = ui.add_sized(
-                                        [name_width, row_height],
+                                        [name_width - 80.0, row_height],
                                         egui::SelectableLabel::new(is_selected, label),
                                     );
                                     if response.clicked() {
                                         state.selected_part_id = Some(*id);
+                                        state.selection_time = Some(std::time::Instant::now());
                                     }
                                     response.context_menu(|ui| {
                                         if ui.button("Delete").clicked() {
@@ -1434,20 +1501,47 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                         }
                                     });
 
+                                    // Column 3: State name badge (blue background)
+                                    let state_badge = egui::Frame::none()
+                                        .fill(egui::Color32::from_rgb(50, 80, 130))
+                                        .rounding(3.0)
+                                        .inner_margin(egui::Margin::symmetric(4.0, 1.0));
+                                    state_badge.show(ui, |ui| {
+                                        ui.label(egui::RichText::new(state_name).small().color(egui::Color32::WHITE));
+                                    });
+
+                                    // Column 4: Rotation badge (green background)
+                                    let rot_badge = egui::Frame::none()
+                                        .fill(egui::Color32::from_rgb(50, 100, 60))
+                                        .rounding(3.0)
+                                        .inner_margin(egui::Margin::symmetric(4.0, 1.0));
+                                    rot_badge.show(ui, |ui| {
+                                        ui.label(egui::RichText::new(format!("{}°", rotation)).small().color(egui::Color32::WHITE));
+                                    });
+
                                     // Column 3: Move up (fixed width)
                                     let can_move_up = *idx < layers_len - 1;
+                                    let shift_held = ui.input(|i| i.modifiers.shift);
                                     if ui.add_sized([button_width, row_height], egui::Button::new("⏶").small().sense(if can_move_up { egui::Sense::click() } else { egui::Sense::hover() }))
-                                        .on_hover_text("Move layer up")
+                                        .on_hover_text("Move layer up (Hold Shift to move to top)")
                                         .clicked() && can_move_up {
-                                        move_up = Some(*idx);
+                                        if shift_held {
+                                            move_to_top = Some(*idx);
+                                        } else {
+                                            move_up = Some(*idx);
+                                        }
                                     }
 
                                     // Column 4: Move down (fixed width)
                                     let can_move_down = *idx > 0;
                                     if ui.add_sized([button_width, row_height], egui::Button::new("⏷").small().sense(if can_move_down { egui::Sense::click() } else { egui::Sense::hover() }))
-                                        .on_hover_text("Move layer down")
+                                        .on_hover_text("Move layer down (Hold Shift to move to bottom)")
                                         .clicked() && can_move_down {
-                                        move_down = Some(*idx);
+                                        if shift_held {
+                                            move_to_bottom = Some(*idx);
+                                        } else {
+                                            move_down = Some(*idx);
+                                        }
                                     }
 
                                     // Column 5: Delete (fixed width)
@@ -1513,6 +1607,41 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                                 if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
                                     if idx > 0 {
                                         frame.placed_parts.swap(idx, idx - 1);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(idx) = move_to_top {
+                if let Some(ref mut project) = state.project {
+                    if let Some(ref char_name) = active_char {
+                        if let Some(character) = project.get_character_mut(char_name) {
+                            if let Some(anim) = character.animations.get_mut(current_anim) {
+                                if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                    let len = frame.placed_parts.len();
+                                    if idx < len - 1 {
+                                        // Remove and push to end (top in render order)
+                                        let part = frame.placed_parts.remove(idx);
+                                        frame.placed_parts.push(part);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(idx) = move_to_bottom {
+                if let Some(ref mut project) = state.project {
+                    if let Some(ref char_name) = active_char {
+                        if let Some(character) = project.get_character_mut(char_name) {
+                            if let Some(anim) = character.animations.get_mut(current_anim) {
+                                if let Some(frame) = anim.frames.get_mut(current_frame_idx) {
+                                    if idx > 0 {
+                                        // Remove and insert at beginning (bottom in render order)
+                                        let part = frame.placed_parts.remove(idx);
+                                        frame.placed_parts.insert(0, part);
                                     }
                                 }
                             }
@@ -1705,9 +1834,11 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 }
             }
         });
+    } // end right panel project check
 
-    // Timeline (bottom panel) - only show if an animation is selected
-    if state.current_animation().is_some() {
+    // Timeline (bottom panel) - only show on canvas tab when an animation is selected
+    let is_canvas_tab = matches!(state.active_tab, ActiveTab::Canvas);
+    if is_canvas_tab && state.current_animation().is_some() {
         let total_frames = state.total_frames();
         egui::TopBottomPanel::bottom("timeline")
             .exact_height(120.0)
@@ -1885,22 +2016,25 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
 
     // Central canvas area with tabs
     egui::CentralPanel::default()
+        .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::ZERO))
         .show(ctx, |ui| {
         if state.project.is_none() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.heading("Welcome to Pixel Sprite Studio");
+                ui.label(egui::RichText::new("Welcome to Pixel Sprite Studio!").size(28.0).strong());
+                ui.label(egui::RichText::new("by Elle Trudgett").size(14.0).color(egui::Color32::GRAY));
+                ui.label(format!("v{}", VERSION));
                 ui.add_space(10.0);
                 ui.label("Create or open a project to begin.");
                 ui.add_space(20.0);
 
-                if ui.button("New Project").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("New Project").size(18.0)).min_size(egui::vec2(160.0, 40.0))).clicked() {
                     state.new_project();
                 }
 
                 ui.add_space(10.0);
 
-                if ui.button("Open Project...").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("Open Project...").size(18.0)).min_size(egui::vec2(160.0, 40.0))).clicked() {
                     if let Some(path) = pick_open_file() {
                         let path_str = path.to_string_lossy().to_string();
                         match state.load_project(&path_str) {
@@ -1928,6 +2062,14 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "Unknown".to_string());
 
+                        // Get file modification time as relative string
+                        let modified_ago = std::fs::metadata(&path_buf)
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|time| time.elapsed().ok())
+                            .map(format_relative_time)
+                            .unwrap_or_else(|| "unknown".to_string());
+
                         // Try to read project to get character names
                         let characters: Vec<String> = std::fs::read_to_string(&path_buf)
                             .ok()
@@ -1935,44 +2077,78 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             .map(|p| p.characters.iter().map(|c| c.name.clone()).collect())
                             .unwrap_or_default();
 
-                        // Card frame
-                        let card_response = egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(45, 45, 55))
-                            .rounding(8.0)
-                            .inner_margin(12.0)
-                            .show(ui, |ui| {
-                                ui.set_min_width(300.0);
+                        // Card frame - center with spacers
+                        // Estimate card width for centering (path is usually the widest element)
+                        let estimated_card_width = (path.len() as f32 * 7.0).max(300.0);
+                        let card_response = ui.horizontal(|ui| {
+                            // Left spacer - center the card by accounting for its width
+                            let available = ui.available_width();
+                            ui.add_space(((available - estimated_card_width) / 2.0).max(0.0));
 
-                                // Header row with title and remove button
-                                ui.horizontal(|ui| {
-                                    ui.heading(&filename);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("×").on_hover_text("Remove from recent").clicked() {
-                                            project_to_remove = Some(path.clone());
+                            let frame_response = egui::Frame::none()
+                                .fill(egui::Color32::from_rgb(45, 45, 55))
+                                .rounding(8.0)
+                                .inner_margin(12.0)
+                                .show(ui, |ui| {
+                                    // Explicit vertical layout for contents
+                                    ui.vertical(|ui| {
+                                        ui.heading(&filename);
+
+                                        ui.label(
+                                            egui::RichText::new(&modified_ago)
+                                                .size(scaled_font(11.0, ui_scale))
+                                                .color(egui::Color32::from_gray(120))
+                                        );
+
+                                        ui.label(
+                                            egui::RichText::new(path)
+                                                .size(scaled_font(12.0, ui_scale))
+                                                .color(egui::Color32::GRAY)
+                                        );
+
+                                        // Characters list
+                                        if !characters.is_empty() {
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new("Characters:").size(scaled_font(12.0, ui_scale)).strong());
+                                            for char_name in &characters {
+                                                ui.label(egui::RichText::new(format!("• {}", char_name)).size(scaled_font(12.0, ui_scale)));
+                                            }
                                         }
                                     });
                                 });
 
-                                // Path as subheading
-                                ui.label(
-                                    egui::RichText::new(path)
-                                        .size(scaled_font(12.0, ui_scale))
-                                        .color(egui::Color32::GRAY)
-                                );
+                            // Right spacer
+                            ui.add_space(ui.available_width());
 
-                                // Characters list
-                                if !characters.is_empty() {
-                                    ui.add_space(8.0);
-                                    ui.label(egui::RichText::new("Characters:").size(scaled_font(12.0, ui_scale)).strong());
-                                    for char_name in &characters {
-                                        ui.label(egui::RichText::new(format!("  • {}", char_name)).size(scaled_font(12.0, ui_scale)));
-                                    }
-                                }
-                            });
+                            frame_response
+                        });
 
-                        // Highlight on hover and handle click
-                        let card_rect = card_response.response.rect;
-                        if ui.rect_contains_pointer(card_rect) {
+                        // Get the frame rect for the X button positioning
+                        let card_rect = card_response.inner.response.rect;
+
+                        // Draw X button at top right corner of card
+                        let button_size = 24.0;
+                        let button_rect = egui::Rect::from_min_size(
+                            egui::pos2(card_rect.right() - button_size - 4.0, card_rect.top() + 4.0),
+                            egui::vec2(button_size, button_size),
+                        );
+                        let button_response = ui.interact(button_rect, ui.id().with(path), egui::Sense::click());
+                        let visuals = ui.style().interact(&button_response);
+                        ui.painter().rect_filled(button_rect, 4.0, visuals.bg_fill);
+                        ui.painter().text(
+                            button_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "×",
+                            egui::FontId::proportional(18.0),
+                            visuals.text_color(),
+                        );
+                        if button_response.on_hover_text("Remove from recent").clicked() {
+                            project_to_remove = Some(path.clone());
+                        }
+
+                        // Highlight on hover and handle click (but not if clicking X button)
+                        let hovering_button = ui.rect_contains_pointer(button_rect);
+                        if ui.rect_contains_pointer(card_rect) && !hovering_button {
                             // Draw highlight
                             ui.painter().rect_stroke(
                                 card_rect,
@@ -2012,7 +2188,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
             // Only show tabs if a character is selected
             if state.active_character.is_some() {
                 // Tab bar
+                ui.add_space(8.0); // Top margin
                 ui.horizontal(|ui| {
+                    ui.add_space(8.0); // Left margin
                     // Canvas tab
                     let is_canvas = matches!(state.active_tab, ActiveTab::Canvas);
                     if tab_button(ui, is_canvas, "Canvas").clicked() {
@@ -2036,15 +2214,16 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                     ActiveTab::Canvas => {
                         // View options bar (horizontal, under tabs)
                         ui.horizontal(|ui| {
+                            ui.add_space(8.0); // Left margin
                             ui.heading("View");
                             ui.separator();
                             ui.label("Zoom:");
                             egui::ComboBox::from_id_salt("zoom_level_canvas")
-                                .selected_text(format!("{:.0}x", state.zoom_level))
+                                .selected_text(format_zoom(state.zoom_level))
                                 .width(50.0)
                                 .show_ui(ui, |ui| {
                                     for &level in &ZOOM_LEVELS {
-                                        ui.selectable_value(&mut state.zoom_level, level, format!("{:.0}x", level));
+                                        ui.selectable_value(&mut state.zoom_level, level, format_zoom(level));
                                     }
                                 });
                             ui.label("Show:");
@@ -2063,9 +2242,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                         });
                         ui.separator();
 
-                        // Dark background for canvas area - use outer_margin to extend to edges
+                        // Dark background for canvas area - negative outer_margin extends fill to panel edges
                         egui::Frame::none()
-                            .fill(egui::Color32::from_gray(20))
+                            .fill(egui::Color32::from_gray(10))
                             .outer_margin(egui::Margin { left: -8.0, right: -8.0, top: -5.0, bottom: -8.0 })
                             .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 6.0, bottom: 8.0 })
                             .show(ui, |ui| {
@@ -2448,7 +2627,8 @@ struct PlacedPartRenderInfo {
     id: u64,
     part_name: String,
     layer_name: String,
-    character_name: String,
+    character_id: u64,
+    character_name: String, // Used for texture cache keys
     state_name: String,
     rotation: u16,
     position: (f32, f32),
@@ -2466,16 +2646,16 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     // Capture values from project upfront to avoid borrow conflicts
-    let (canvas_size, placed_parts, char_name, anim_name, reference_info) = {
+    let (canvas_size, placed_parts, char_name, anim_name, anim_info, reference_info) = {
         let Some(ref project) = state.project else { return };
         let active_char = state.active_character.as_ref();
 
         let char_name = active_char.cloned().unwrap_or_default();
-        let anim_name = active_char
+        let (anim_name, anim_info) = active_char
             .and_then(|name| project.get_character(name))
             .and_then(|c| c.animations.get(state.current_animation))
-            .map(|a| format!("{} ({} frames)", a.name, a.frames.len()))
-            .unwrap_or_default();
+            .map(|a| (a.name.clone(), Some((a.frames.len(), a.fps))))
+            .unwrap_or((String::new(), None));
 
         // Get reference info for current frame
         let reference_info: Option<ReferenceRenderInfo> = active_char
@@ -2497,18 +2677,25 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             .map(|frame| {
                 frame.placed_parts.iter()
                     .map(|p| {
+                        // Look up character by ID (stable across renames)
+                        let character = project.get_character_by_id(p.character_id);
+
                         // Look up image data for this part
-                        let image_data = project.get_character(&p.character_name)
+                        let image_data = character
                             .and_then(|c| c.get_part(&p.part_name))
                             .and_then(|part| part.states.iter().find(|s| s.name == p.state_name))
                             .and_then(|s| s.rotations.get(&p.rotation))
                             .and_then(|r| r.image_data.clone());
 
+                        // Get character name for texture cache keys
+                        let character_name = character.map(|c| c.name.clone()).unwrap_or_default();
+
                         PlacedPartRenderInfo {
                             id: p.id,
                             part_name: p.part_name.clone(),
                             layer_name: if p.layer_name.is_empty() { p.part_name.clone() } else { p.layer_name.clone() },
-                            character_name: p.character_name.clone(),
+                            character_id: p.character_id,
+                            character_name,
                             state_name: p.state_name.clone(),
                             rotation: p.rotation,
                             position: p.position,
@@ -2526,7 +2713,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             .map(|c| c.canvas_size)
             .unwrap_or((64, 64));
 
-        (canvas_size, parts, char_name, anim_name, reference_info)
+        (canvas_size, parts, char_name, anim_name, anim_info, reference_info)
     };
 
     let available = ui.available_size();
@@ -2541,10 +2728,41 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     let offset_y = (available.y - canvas_h) / 2.0 + state.canvas_offset.1;
 
     let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
+
+    // Floor canvas origin in SCREEN PIXEL space, then convert back to points.
+    // This ensures we start at an actual pixel boundary.
+    let canvas_origin_x = ((response.rect.min.x + offset_x) * ppp).floor() / ppp;
+    let canvas_origin_y = ((response.rect.min.y + offset_y) * ppp).floor() / ppp;
+    let canvas_origin = egui::pos2(canvas_origin_x, canvas_origin_y);
+
+    // Canvas size should also be calculated in pixels then converted
+    // zoom_level = screen pixels per canvas pixel
+    let canvas_w_pixels = canvas_size.0 as f32 * state.zoom_level;
+    let canvas_h_pixels = canvas_size.1 as f32 * state.zoom_level;
     let canvas_rect = egui::Rect::from_min_size(
-        response.rect.min + egui::vec2(offset_x, offset_y),
-        egui::vec2(canvas_w, canvas_h),
+        canvas_origin,
+        egui::vec2(canvas_w_pixels / ppp, canvas_h_pixels / ppp),
     );
+
+    // Fit/Center button in top-right corner
+    let button_size = 24.0;
+    let button_margin = 8.0;
+    let button_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            response.rect.max.x - button_size - button_margin,
+            response.rect.min.y + button_margin,
+        ),
+        egui::vec2(button_size, button_size),
+    );
+    let fit_button = ui.put(
+        button_rect,
+        egui::Button::new(egui::RichText::new("⊙").size(16.0))
+            .min_size(egui::vec2(button_size, button_size)),
+    );
+    if fit_button.on_hover_text("Fit canvas to view and center").clicked() {
+        state.zoom_level = calculate_fit_zoom(canvas_size, available, ppp);
+        state.canvas_offset = (0.0, 0.0);
+    }
 
     // Check for panning input (space key or middle mouse button)
     let space_held = ui.input(|i| i.key_down(egui::Key::Space));
@@ -2571,21 +2789,27 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     }
 
-    // Draw canvas background
+    // Draw canvas frame background (the actual sprite canvas)
     painter.rect_filled(canvas_rect, 0.0, egui::Color32::from_rgb(40, 40, 50));
 
     // Helper to render reference image
     let reference_opacity = state.reference_opacity;
     let reference_show_on_top = state.reference_show_on_top;
+    let zoom_level = state.zoom_level;
     let render_reference = |painter: &egui::Painter, ref_info: &ReferenceRenderInfo,
                             texture: &egui::TextureHandle, original_size: (u32, u32), opacity: f32| {
-        // Calculate position in screen space
-        let screen_x = canvas_rect.min.x + ref_info.position.0 * effective_zoom;
-        let screen_y = canvas_rect.min.y + ref_info.position.1 * effective_zoom;
+        // Calculate position in screen pixels, then convert to points
+        let ref_origin_pixels_x = canvas_origin_x * ppp;
+        let ref_origin_pixels_y = canvas_origin_y * ppp;
+        let ref_pixels_x = ref_origin_pixels_x + ref_info.position.0 * zoom_level;
+        let ref_pixels_y = ref_origin_pixels_y + ref_info.position.1 * zoom_level;
+        let screen_x = ref_pixels_x / ppp;
+        let screen_y = ref_pixels_y / ppp;
 
-        // Calculate displayed size (original size * scale * zoom)
-        let display_w = original_size.0 as f32 * ref_info.scale * effective_zoom;
-        let display_h = original_size.1 as f32 * ref_info.scale * effective_zoom;
+        // Calculate displayed size in screen pixels, then convert to points
+        // (original size * scale * zoom = screen pixels)
+        let display_w = original_size.0 as f32 * ref_info.scale * zoom_level / ppp;
+        let display_h = original_size.1 as f32 * ref_info.scale * zoom_level / ppp;
 
         let ref_rect = egui::Rect::from_min_size(
             egui::pos2(screen_x, screen_y),
@@ -2625,27 +2849,30 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
 
-    // Draw grid if enabled
+    // Draw grid if enabled - calculate in pixel space for consistency with sprites
     if state.show_grid {
         let grid_color = egui::Color32::from_rgba_unmultiplied(100, 100, 100, 60);
-        let cell_size = effective_zoom;
+        // Canvas origin in screen pixels
+        let origin_pixels_x = canvas_origin_x * ppp;
+        let origin_pixels_y = canvas_origin_y * ppp;
 
-        let mut x = canvas_rect.min.x;
-        while x <= canvas_rect.max.x {
+        for i in 0..=canvas_size.0 {
+            // Calculate grid line position in pixels, convert to points
+            let x_pixels = origin_pixels_x + i as f32 * state.zoom_level;
+            let x = x_pixels / ppp;
             painter.line_segment(
                 [egui::pos2(x, canvas_rect.min.y), egui::pos2(x, canvas_rect.max.y)],
                 egui::Stroke::new(1.0, grid_color),
             );
-            x += cell_size;
         }
 
-        let mut y = canvas_rect.min.y;
-        while y <= canvas_rect.max.y {
+        for i in 0..=canvas_size.1 {
+            let y_pixels = origin_pixels_y + i as f32 * state.zoom_level;
+            let y = y_pixels / ppp;
             painter.line_segment(
                 [egui::pos2(canvas_rect.min.x, y), egui::pos2(canvas_rect.max.x, y)],
                 egui::Stroke::new(1.0, grid_color),
             );
-            y += cell_size;
         }
     }
 
@@ -2658,14 +2885,24 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Draw placed parts (in list order - later items drawn on top)
     let show_labels = state.show_labels;
+    // Pre-calculate canvas origin in pixels for sprite positioning
+    let origin_pixels_x = canvas_origin_x * ppp;
+    let origin_pixels_y = canvas_origin_y * ppp;
+
     for part_info in &placed_parts {
         // Skip invisible layers
         if !part_info.visible {
             continue;
         }
 
-        let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
-        let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
+        // Calculate sprite position in screen pixels, then convert to points
+        // Don't floor here - let sprites move smoothly with the canvas
+        // The canvas origin is already pixel-aligned, so sprites at integer canvas positions
+        // will naturally be at pixel boundaries
+        let sprite_pixels_x = origin_pixels_x + part_info.position.0 * state.zoom_level;
+        let sprite_pixels_y = origin_pixels_y + part_info.position.1 * state.zoom_level;
+        let screen_x = sprite_pixels_x / ppp;
+        let screen_y = sprite_pixels_y / ppp;
 
         let is_selected = state.selected_part_id == Some(part_info.id);
 
@@ -2689,7 +2926,11 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             if let Some(texture) = state.texture_cache.get(&texture_key) {
                 let tex_size = texture.size_vec2();
                 image_size = (tex_size.x, tex_size.y);
-                let scaled_size = egui::vec2(tex_size.x * effective_zoom, tex_size.y * effective_zoom);
+                // Calculate size in screen pixels (should be integer), then convert to points
+                // Round to ensure exact integer pixel dimensions
+                let size_pixels_x = (tex_size.x * state.zoom_level).round();
+                let size_pixels_y = (tex_size.y * state.zoom_level).round();
+                let scaled_size = egui::vec2(size_pixels_x / ppp, size_pixels_y / ppp);
                 part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
                     scaled_size,
@@ -2709,11 +2950,11 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
         // Fallback: draw colored rectangle if no texture
         if !rendered_texture {
-            let part_size_x = image_size.0 * effective_zoom;
-            let part_size_y = image_size.1 * effective_zoom;
+            let part_size_pixels_x = (image_size.0 * state.zoom_level).round();
+            let part_size_pixels_y = (image_size.1 * state.zoom_level).round();
             part_rect = egui::Rect::from_min_size(
                 egui::pos2(screen_x, screen_y),
-                egui::vec2(part_size_x, part_size_y),
+                egui::vec2(part_size_pixels_x / ppp, part_size_pixels_y / ppp),
             );
 
             // Color based on part name hash for variety
@@ -2735,24 +2976,61 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             );
         }
 
-        // Draw selection border (yellow) or label border (red)
-        if is_selected {
-            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
-        } else if show_labels {
-            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::RED));
+        // Draw yellow flash when part is first selected (no continuous pulse)
+        if is_selected && rendered_texture {
+            let elapsed = state.selection_time
+                .map(|t| t.elapsed().as_secs_f32())
+                .unwrap_or(1.0);
+
+            // Flash decays exponentially over ~0.5s
+            let flash_intensity = (-elapsed * 8.0).exp();
+
+            // Only draw if flash is still visible
+            if flash_intensity > 0.01 {
+                let alpha = (flash_intensity * 255.0) as u8;
+
+                // Get or create yellow silhouette texture
+                let yellow_key = format!("{}_yellow", texture_key);
+                if !state.texture_cache.contains_key(&yellow_key) {
+                    if let Some(ref base64_data) = part_info.image_data {
+                        if let Ok(yellow_tex) = decode_base64_to_yellow_texture(ui.ctx(), &yellow_key, base64_data) {
+                            state.texture_cache.insert(yellow_key.clone(), yellow_tex);
+                        }
+                    }
+                }
+
+                // Draw yellow silhouette
+                if let Some(yellow_texture) = state.texture_cache.get(&yellow_key) {
+                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                    let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+                    painter.image(yellow_texture.id(), part_rect, uv, tint);
+                }
+
+                // Request repaint only while flash is animating
+                ui.ctx().request_repaint();
+            }
         }
 
-        // Draw label box in top-left corner if show_labels is enabled
+        // Draw label box in top-left corner if show_labels is enabled (before border so border is on top)
         if show_labels {
             let label_text = &part_info.layer_name;
             let font = egui::FontId::proportional(scaled_font(12.0, state.config.ui_scale));
+            let small_font = egui::FontId::proportional(scaled_font(10.0, state.config.ui_scale));
             let text_color = egui::Color32::WHITE;
             let bg_color = egui::Color32::from_rgba_unmultiplied(200, 0, 0, 220);
+            let state_bg = egui::Color32::from_rgb(50, 80, 130);
+            let rot_bg = egui::Color32::from_rgb(50, 100, 60);
 
-            // Measure text size
+            // Measure text sizes
             let galley = painter.layout_no_wrap(label_text.clone(), font.clone(), text_color);
             let text_size = galley.size();
+            let state_galley = painter.layout_no_wrap(part_info.state_name.clone(), small_font.clone(), text_color);
+            let state_size = state_galley.size();
+            let rot_text = format!("{}°", part_info.rotation);
+            let rot_galley = painter.layout_no_wrap(rot_text, small_font.clone(), text_color);
+            let rot_size = rot_galley.size();
             let padding = 2.0;
+            let badge_gap = 2.0;
 
             let label_height = text_size.y + padding * 2.0;
             let label_rect = egui::Rect::from_min_size(
@@ -2769,6 +3047,37 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 galley,
                 text_color,
             );
+
+            // Draw state badge (blue, flat rectangle)
+            let state_rect = egui::Rect::from_min_size(
+                egui::pos2(label_rect.max.x + badge_gap, label_rect.min.y),
+                egui::vec2(state_size.x + padding * 2.0, label_height),
+            );
+            painter.rect_filled(state_rect, 0.0, state_bg);
+            painter.galley(
+                egui::pos2(state_rect.min.x + padding, state_rect.min.y + padding + (label_height - padding * 2.0 - state_size.y) / 2.0),
+                state_galley,
+                text_color,
+            );
+
+            // Draw rotation badge (green, flat rectangle)
+            let rot_rect = egui::Rect::from_min_size(
+                egui::pos2(state_rect.max.x + badge_gap, label_rect.min.y),
+                egui::vec2(rot_size.x + padding * 2.0, label_height),
+            );
+            painter.rect_filled(rot_rect, 0.0, rot_bg);
+            painter.galley(
+                egui::pos2(rot_rect.min.x + padding, rot_rect.min.y + padding + (label_height - padding * 2.0 - rot_size.y) / 2.0),
+                rot_galley,
+                text_color,
+            );
+        }
+
+        // Draw selection border (yellow) or label border (red) - on top of labels
+        if is_selected {
+            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(2.0, egui::Color32::YELLOW));
+        } else if show_labels {
+            painter.rect_stroke(part_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::RED));
         }
     }
 
@@ -2875,7 +3184,7 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         (centered_x, centered_y)
                     };
                     state.place_part_on_canvas(
-                        &gallery_drag.character_name,
+                        gallery_drag.character_id,
                         &gallery_drag.part_name,
                         &gallery_drag.state_name,
                         x,
@@ -2893,15 +3202,18 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
         if let Some(pos) = response.hover_pos() {
             let mut hovering_part = false;
             for part_info in placed_parts.iter().rev() {
-                let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
-                let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
+                // Use pixel-space calculations to match rendering
+                let hit_origin_pixels_x = canvas_origin_x * ppp;
+                let hit_origin_pixels_y = canvas_origin_y * ppp;
+                let screen_x = (hit_origin_pixels_x + part_info.position.0 * state.zoom_level) / ppp;
+                let screen_y = (hit_origin_pixels_y + part_info.position.1 * state.zoom_level) / ppp;
                 let part_size = if let Some(texture) = state.texture_cache.get(&format!(
                     "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
                     part_info.state_name, part_info.rotation
                 )) {
-                    texture.size_vec2() * effective_zoom
+                    texture.size_vec2() * state.zoom_level / ppp
                 } else {
-                    egui::vec2(16.0, 16.0) * effective_zoom
+                    egui::vec2(16.0, 16.0) * state.zoom_level / ppp
                 };
                 let part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
@@ -2924,6 +3236,8 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
     // Handle mouse interactions - select on mousedown (not mouseup)
     // Skip if we're panning
+    // Save last clicked part BEFORE processing this frame's click (for double-click validation)
+    let prev_clicked_part = state.last_clicked_part_id;
     let should_check_selection = !is_panning && ui.input(|i| i.pointer.any_pressed());
     if should_check_selection {
         if let Some(pos) = response.interact_pointer_pos() {
@@ -2931,16 +3245,23 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             let mut candidates: Vec<(u64, Option<&String>, f32, f32, egui::Vec2)> = Vec::new();
 
             for part_info in placed_parts.iter().rev() { // Reverse for top-to-bottom
-                let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
-                let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
+                // Skip invisible layers - they shouldn't be selectable
+                if !part_info.visible {
+                    continue;
+                }
+                // Use pixel-space calculations to match rendering
+                let click_origin_pixels_x = canvas_origin_x * ppp;
+                let click_origin_pixels_y = canvas_origin_y * ppp;
+                let screen_x = (click_origin_pixels_x + part_info.position.0 * state.zoom_level) / ppp;
+                let screen_y = (click_origin_pixels_y + part_info.position.1 * state.zoom_level) / ppp;
                 // Use cached texture size if available, otherwise default 16x16
                 let part_size = if let Some(texture) = state.texture_cache.get(&format!(
                     "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
                     part_info.state_name, part_info.rotation
                 )) {
-                    texture.size_vec2() * effective_zoom
+                    texture.size_vec2() * state.zoom_level / ppp
                 } else {
-                    egui::vec2(16.0, 16.0) * effective_zoom
+                    egui::vec2(16.0, 16.0) * state.zoom_level / ppp
                 };
                 let part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
@@ -2968,8 +3289,9 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 }
 
                 // Calculate pixel coordinates within the part
-                let pixel_x = ((pos.x - screen_x) / effective_zoom) as u32;
-                let pixel_y = ((pos.y - screen_y) / effective_zoom) as u32;
+                // Convert point difference to texture pixels: (pos - screen) * ppp / zoom_level
+                let pixel_x = ((pos.x - screen_x) * ppp / state.zoom_level) as u32;
+                let pixel_y = ((pos.y - screen_y) * ppp / state.zoom_level) as u32;
 
                 // Check if pixel is opaque
                 if let Some(data) = image_data {
@@ -2985,7 +3307,17 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             }
 
             // Use the first opaque hit, or fall back to topmost if all transparent
-            state.selected_part_id = clicked_part.or(topmost_fallback);
+            let new_selection = clicked_part.or(topmost_fallback);
+
+            // Track what was clicked for double-click validation
+            state.last_clicked_part_id = new_selection;
+
+            if new_selection != state.selected_part_id {
+                state.selected_part_id = new_selection;
+                if new_selection.is_some() {
+                    state.selection_time = Some(std::time::Instant::now());
+                }
+            }
 
             // Initialize drag accumulator if we selected a part
             if let Some(part) = state.get_selected_placed_part() {
@@ -2995,19 +3327,24 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     // Handle double-click to navigate to character editor for that part
+    // Only process if the double-clicked part is the same as the currently selected part
+    // (prevents fake double-clicks where first click was elsewhere)
     if !is_panning && response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             // Find which part was double-clicked (same logic as single-click)
             for part_info in placed_parts.iter().rev() {
-                let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
-                let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
+                // Use pixel-space calculations to match rendering
+                let dbl_origin_pixels_x = canvas_origin_x * ppp;
+                let dbl_origin_pixels_y = canvas_origin_y * ppp;
+                let screen_x = (dbl_origin_pixels_x + part_info.position.0 * state.zoom_level) / ppp;
+                let screen_y = (dbl_origin_pixels_y + part_info.position.1 * state.zoom_level) / ppp;
                 let part_size = if let Some(texture) = state.texture_cache.get(&format!(
                     "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
                     part_info.state_name, part_info.rotation
                 )) {
-                    texture.size_vec2() * effective_zoom
+                    texture.size_vec2() * state.zoom_level / ppp
                 } else {
-                    egui::vec2(16.0, 16.0) * effective_zoom
+                    egui::vec2(16.0, 16.0) * state.zoom_level / ppp
                 };
                 let part_rect = egui::Rect::from_min_size(
                     egui::pos2(screen_x, screen_y),
@@ -3016,8 +3353,8 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
                 if part_rect.contains(pos) {
                     // Check pixel transparency if we have image data
-                    let pixel_x = ((pos.x - screen_x) / effective_zoom) as u32;
-                    let pixel_y = ((pos.y - screen_y) / effective_zoom) as u32;
+                    let pixel_x = ((pos.x - screen_x) * ppp / state.zoom_level) as u32;
+                    let pixel_y = ((pos.y - screen_y) * ppp / state.zoom_level) as u32;
 
                     let is_hit = if let Some(data) = &part_info.image_data {
                         is_pixel_opaque(data, pixel_x, pixel_y)
@@ -3026,10 +3363,13 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                     };
 
                     if is_hit {
-                        // Navigate to character editor for this part
-                        state.active_tab = ActiveTab::CharacterEditor(part_info.character_name.clone());
-                        state.editor_selected_part = Some(part_info.part_name.clone());
-                        state.editor_selected_state = Some(part_info.state_name.clone());
+                        // Only navigate if BOTH clicks of the double-click were on the same part
+                        // prev_clicked_part is from the first click, part_info.id is the second click
+                        if prev_clicked_part == Some(part_info.id) {
+                            state.active_tab = ActiveTab::CharacterEditor(part_info.character_name.clone());
+                            state.editor_selected_part = Some(part_info.part_name.clone());
+                            state.editor_selected_state = Some(part_info.state_name.clone());
+                        }
                         break;
                     }
                 }
@@ -3110,16 +3450,27 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                 response.rect.min + egui::vec2(10.0, 10.0),
                 egui::Align2::LEFT_TOP,
                 &char_name,
-                egui::FontId::proportional(scaled_font(20.0, state.config.ui_scale)),
+                egui::FontId::proportional(scaled_font(24.0, state.config.ui_scale)),
                 egui::Color32::WHITE,
             );
             painter.text(
-                response.rect.min + egui::vec2(10.0, 34.0),
+                response.rect.min + egui::vec2(10.0, 40.0),
                 egui::Align2::LEFT_TOP,
                 &anim_name,
-                egui::FontId::proportional(scaled_font(14.0, state.config.ui_scale)),
+                egui::FontId::proportional(scaled_font(18.0, state.config.ui_scale)),
                 egui::Color32::GRAY,
             );
+            // Frame count, FPS, and duration
+            if let Some((frame_count, fps)) = anim_info {
+                let duration = frame_count as f32 / fps as f32;
+                painter.text(
+                    response.rect.min + egui::vec2(10.0, 64.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{} frames @ {}fps = {:.2}s", frame_count, fps, duration),
+                    egui::FontId::proportional(scaled_font(14.0, state.config.ui_scale)),
+                    egui::Color32::from_gray(140),
+                );
+            }
         }
 
         // Canvas info at bottom left corner
@@ -3409,7 +3760,7 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
 
                 // Show time since last save
                 if let Some(last_saved) = state.last_saved_time {
-                    ui.label(format!("Last saved {}.", format_relative_time(last_saved)));
+                    ui.label(format!("Last saved {}.", format_relative_time(last_saved.elapsed())));
                 } else {
                     ui.label("This project has never been saved.");
                 }
@@ -3623,11 +3974,13 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() && !state.new_character_name.is_empty() {
                         if let Some(ref mut project) = state.project {
-                            let character = Character::new(&state.new_character_name);
+                            let char_id = project.next_char_id();
+                            let character = Character::new(char_id, &state.new_character_name);
                             project.add_character(character);
                             state.active_character = Some(state.new_character_name.clone());
                             state.current_animation = 0;
                             state.current_frame = 0;
+                            state.needs_zoom_fit = true;
                             // Open the character editor for the new character
                             state.active_tab = ActiveTab::CharacterEditor(state.new_character_name.clone());
                             state.set_status(format!("Created character: {}", state.new_character_name));
@@ -3681,11 +4034,13 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                             if let Some(ref mut project) = state.project {
                                 if let Some(original) = project.get_character(&source_name) {
                                     let mut cloned = original.clone();
+                                    cloned.id = project.next_char_id(); // Assign new unique ID
                                     cloned.name = state.clone_character_name.clone();
                                     project.add_character(cloned);
                                     state.active_character = Some(state.clone_character_name.clone());
                                     state.current_animation = 0;
                                     state.current_frame = 0;
+                                    state.needs_zoom_fit = true;
                                     state.set_status(format!("Cloned '{}' as '{}'", source_name, state.clone_character_name));
                                 }
                             }
@@ -3923,6 +4278,63 @@ fn decode_base64_to_texture(
     ))
 }
 
+/// Create a yellow silhouette texture from base64 image data
+/// All pixels become yellow (255, 255, 0) while preserving alpha
+fn decode_base64_to_yellow_texture(
+    ctx: &egui::Context,
+    name: &str,
+    base64_data: &str,
+) -> Result<egui::TextureHandle, String> {
+    use base64::Engine;
+
+    const MAX_TEXTURE_SIZE: u32 = 2048;
+
+    // Decode base64
+    let png_bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| format!("Failed to decode base64: {}", e))?;
+
+    // Load image
+    let img = image::load_from_memory(&png_bytes)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // Check if image needs to be resized
+    let (width, height) = (img.width(), img.height());
+    let img = if width > MAX_TEXTURE_SIZE || height > MAX_TEXTURE_SIZE {
+        let scale = (MAX_TEXTURE_SIZE as f32 / width as f32)
+            .min(MAX_TEXTURE_SIZE as f32 / height as f32);
+        let new_width = (width as f32 * scale) as u32;
+        let new_height = (height as f32 * scale) as u32;
+        img.resize(new_width, new_height, image::imageops::FilterType::Nearest)
+    } else {
+        img
+    };
+
+    // Convert to RGBA and make all pixels yellow (preserving alpha)
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let mut pixels = rgba.into_raw();
+
+    // Convert every pixel to yellow while preserving alpha
+    for chunk in pixels.chunks_mut(4) {
+        // chunk is [R, G, B, A]
+        chunk[0] = 255; // R
+        chunk[1] = 255; // G
+        chunk[2] = 0;   // B
+        // chunk[3] (alpha) stays the same
+    }
+
+    // Create egui ColorImage
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+
+    // Create texture
+    Ok(ctx.load_texture(
+        name,
+        color_image,
+        egui::TextureOptions::NEAREST,
+    ))
+}
+
 /// Create a small JPG thumbnail for a reference image (for fallback when file is missing)
 fn create_reference_thumbnail(path: &str, max_size: u32) -> Result<(String, (u32, u32)), String> {
     use base64::Engine;
@@ -4033,8 +4445,8 @@ fn render_frame_to_image(
             continue;
         }
 
-        // Find the part's image data
-        let image_data = project.get_character(&placed.character_name)
+        // Find the part's image data (look up by character_id for stability)
+        let image_data = project.get_character_by_id(placed.character_id)
             .and_then(|c| c.get_part(&placed.part_name))
             .and_then(|p| p.states.iter().find(|s| s.name == placed.state_name))
             .and_then(|s| s.rotations.get(&placed.rotation))

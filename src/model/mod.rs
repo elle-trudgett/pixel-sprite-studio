@@ -136,6 +136,9 @@ impl Part {
 /// A character is a collection of parts that form a complete sprite
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Character {
+    /// Unique identifier (assigned on creation, never changes)
+    #[serde(default)]
+    pub id: u64,
     pub name: String,
     pub parts: Vec<Part>,
     #[serde(default)]
@@ -149,8 +152,9 @@ fn default_canvas_size() -> (u32, u32) {
 }
 
 impl Character {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(id: u64, name: impl Into<String>) -> Self {
         Self {
+            id,
             name: name.into(),
             parts: Vec::new(),
             animations: vec![Animation::new("Untitled Animation")],
@@ -187,6 +191,11 @@ impl Character {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacedPart {
     pub id: u64, // Unique ID for this placement
+    /// Character ID reference (preferred, stable across renames)
+    #[serde(default)]
+    pub character_id: u64,
+    /// Legacy character name (kept for backwards compatibility with old projects)
+    #[serde(default)]
     pub character_name: String,
     pub part_name: String,
     #[serde(default)]
@@ -206,14 +215,15 @@ fn default_visible() -> bool {
 impl PlacedPart {
     pub fn new(
         id: u64,
-        character_name: impl Into<String>,
+        character_id: u64,
         part_name: impl Into<String>,
         state_name: impl Into<String>,
     ) -> Self {
         let part_name = part_name.into();
         Self {
             id,
-            character_name: character_name.into(),
+            character_id,
+            character_name: String::new(), // Legacy field, no longer used for new parts
             layer_name: part_name.clone(), // Default layer name is the part name
             part_name,
             state_name: state_name.into(),
@@ -409,6 +419,8 @@ pub struct Project {
     pub editor_state: EditorState,
     #[serde(skip)]
     pub next_part_id: u64, // Runtime counter for unique part placement IDs
+    #[serde(skip)]
+    pub next_character_id: u64, // Runtime counter for unique character IDs
 }
 
 impl Default for Project {
@@ -429,6 +441,7 @@ impl Project {
             reference_thumbnails: HashMap::new(),
             editor_state: EditorState::default(),
             next_part_id: 1,
+            next_character_id: 1,
         }
     }
 
@@ -440,6 +453,14 @@ impl Project {
         self.characters.iter_mut().find(|c| c.name == name)
     }
 
+    pub fn get_character_by_id(&self, id: u64) -> Option<&Character> {
+        self.characters.iter().find(|c| c.id == id)
+    }
+
+    pub fn get_character_by_id_mut(&mut self, id: u64) -> Option<&mut Character> {
+        self.characters.iter_mut().find(|c| c.id == id)
+    }
+
     pub fn add_character(&mut self, character: Character) {
         self.characters.push(character);
     }
@@ -448,6 +469,13 @@ impl Project {
     pub fn next_id(&mut self) -> u64 {
         let id = self.next_part_id;
         self.next_part_id += 1;
+        id
+    }
+
+    /// Generate a unique ID for characters
+    pub fn next_char_id(&mut self) -> u64 {
+        let id = self.next_character_id;
+        self.next_character_id += 1;
         id
     }
 
@@ -522,6 +550,46 @@ impl Project {
             }
         }
 
+        // Migrate character IDs: assign IDs to characters that don't have them
+        // (old projects where id defaults to 0)
+        let max_char_id = project.characters.iter().map(|c| c.id).max().unwrap_or(0);
+        project.next_character_id = max_char_id + 1;
+
+        for character in &mut project.characters {
+            if character.id == 0 {
+                character.id = project.next_character_id;
+                project.next_character_id += 1;
+            }
+        }
+
+        // Build name-to-id mapping for migrating PlacedParts
+        let name_to_id: HashMap<String, u64> = project.characters.iter()
+            .map(|c| (c.name.clone(), c.id))
+            .collect();
+
+        // Migrate PlacedParts: resolve character_name to character_id
+        for character in &mut project.characters {
+            let parent_char_id = character.id; // PlacedParts in this character's animations belong to this character
+            for animation in &mut character.animations {
+                for frame in &mut animation.frames {
+                    for placed_part in &mut frame.placed_parts {
+                        // If character_id is 0 (not set), try to resolve
+                        if placed_part.character_id == 0 {
+                            if !placed_part.character_name.is_empty() {
+                                // Try to resolve from character_name first
+                                if let Some(&id) = name_to_id.get(&placed_part.character_name) {
+                                    placed_part.character_id = id;
+                                }
+                            } else {
+                                // If no character_name, infer from parent character
+                                placed_part.character_id = parent_char_id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(project)
     }
 
@@ -547,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_character_parts() {
-        let mut char = Character::new("Hero");
+        let mut char = Character::new(1, "Hero");
         char.add_part(Part::new("head"));
         char.add_part(Part::new("torso"));
 
