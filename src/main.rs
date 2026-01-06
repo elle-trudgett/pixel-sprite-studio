@@ -33,6 +33,30 @@ fn scaled_font(base_size: f32, scale: f32) -> f32 {
     (base_size.max(12.0) * scale).max(12.0)
 }
 
+/// Format a duration as a human-readable relative time string
+fn format_relative_time(instant: std::time::Instant) -> String {
+    let elapsed = instant.elapsed();
+    let secs = elapsed.as_secs();
+
+    if secs < 3 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{} seconds ago", secs)
+    } else if secs < 120 {
+        "1 minute ago".to_string()
+    } else if secs < 3600 {
+        format!("{} minutes ago", secs / 60)
+    } else if secs < 7200 {
+        "1 hour ago".to_string()
+    } else if secs < 86400 {
+        format!("{} hours ago", secs / 3600)
+    } else if secs < 172800 {
+        "1 day ago".to_string()
+    } else {
+        format!("{} days ago", secs / 86400)
+    }
+}
+
 /// Render a tab-style button that looks distinct from regular selectable labels
 fn tab_button(ui: &mut egui::Ui, selected: bool, text: impl Into<String>) -> egui::Response {
     let text = text.into();
@@ -217,6 +241,7 @@ struct AppState {
     pixel_aligned: bool,
     canvas_offset: (f32, f32), // Pan offset for canvas
     is_panning: bool, // True when space or middle mouse is held
+    pan_started_in_canvas: bool, // True if panning was initiated with mouse inside canvas
 
     // Per-character animation state
     active_character: Option<String>, // Currently selected character
@@ -243,10 +268,15 @@ struct AppState {
     show_import_rotation_dialog: bool,
     show_rename_dialog: bool,
     show_delete_confirm_dialog: bool,
+    show_clone_character_dialog: bool,
 
     // Rename/delete context
     context_menu_target: Option<ContextMenuTarget>,
     rename_new_name: String,
+
+    // Clone character state
+    clone_source_character: Option<String>,
+    clone_character_name: String,
 
     // Rotation import state (from character editor)
     pending_rotation_import: Option<u16>,
@@ -263,7 +293,7 @@ struct AppState {
     import_image_path: String,
 
     // Status message
-    status_message: Option<(String, f64)>, // (message, timestamp)
+    status_message: Option<(String, std::time::Instant)>, // (message, when set)
 
     // Loaded textures cache (texture_id -> egui::TextureHandle)
     texture_cache: HashMap<String, egui::TextureHandle>,
@@ -324,6 +354,7 @@ impl AppState {
             pixel_aligned: true,
             canvas_offset: (0.0, 0.0),
             is_panning: false,
+            pan_started_in_canvas: false,
             active_character: None,
             active_tab: ActiveTab::Canvas,
             editor_selected_part: None,
@@ -340,8 +371,11 @@ impl AppState {
             show_import_rotation_dialog: false,
             show_rename_dialog: false,
             show_delete_confirm_dialog: false,
+            show_clone_character_dialog: false,
             context_menu_target: None,
             rename_new_name: String::new(),
+            clone_source_character: None,
+            clone_character_name: String::new(),
             pending_rotation_import: None,
             new_character_name: String::new(),
             new_part_name: String::new(),
@@ -462,7 +496,7 @@ impl AppState {
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
-        self.status_message = Some((message.into(), 0.0)); // timestamp will be set in UI
+        self.status_message = Some((message.into(), std::time::Instant::now()));
     }
 
     fn save_project(&mut self) -> Result<(), String> {
@@ -939,8 +973,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
         .max_height(24.0)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if let Some((ref msg, _)) = state.status_message {
-                    ui.label(msg);
+                if let Some((ref msg, ref when)) = state.status_message {
+                    let relative_time = format_relative_time(*when);
+                    ui.label(format!("{} ({})", msg, relative_time));
                 } else {
                     ui.label("Ready");
                 }
@@ -992,14 +1027,9 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                             state.show_rename_dialog = true;
                         }
                         if ui.small_button("Clone").clicked() {
-                            if let Some(ref mut project) = state.project {
-                                if let Some(original) = project.get_character(&active_char) {
-                                    let mut cloned = original.clone();
-                                    cloned.name = format!("{} (Copy)", original.name);
-                                    project.add_character(cloned);
-                                    state.set_status(format!("Cloned character '{}'", active_char));
-                                }
-                            }
+                            state.clone_source_character = Some(active_char.clone());
+                            state.clone_character_name = format!("{} (copy)", active_char);
+                            state.show_clone_character_dialog = true;
                         }
                         if ui.small_button("Delete").clicked() {
                             state.context_menu_target = Some(ContextMenuTarget::Character {
@@ -1760,7 +1790,7 @@ fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: Res<
                 ui.separator();
                 ui.label("FPS:");
                 let mut fps = state.current_animation().map(|a| a.fps).unwrap_or(12);
-                if ui.add(egui::DragValue::new(&mut fps).speed(1).range(1..=60)).changed() {
+                if ui.add(egui::DragValue::new(&mut fps).speed(0.1).range(1..=60)).changed() {
                     if let Some(anim) = state.current_animation_mut() {
                         anim.fps = fps;
                     }
@@ -2512,10 +2542,24 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     let space_held = ui.input(|i| i.key_down(egui::Key::Space));
     let middle_mouse_held = ui.input(|i| i.pointer.middle_down());
     let is_panning = space_held || middle_mouse_held;
+
+    // Track whether panning started inside the canvas
+    let was_panning = state.is_panning;
+    if is_panning && !was_panning {
+        // Panning just started - check if mouse is inside canvas area
+        if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+            state.pan_started_in_canvas = response.rect.contains(pos);
+        } else {
+            state.pan_started_in_canvas = false;
+        }
+    } else if !is_panning {
+        // Panning ended - reset the flag
+        state.pan_started_in_canvas = false;
+    }
     state.is_panning = is_panning;
 
-    // Set cursor to grabbing hand when panning
-    if is_panning {
+    // Set cursor to grabbing hand when panning (only if started in canvas)
+    if is_panning && state.pan_started_in_canvas {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     }
 
@@ -2775,12 +2819,12 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
 
         // Set cursor to indicate dragging
         ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-    } else if space_held {
+    } else if space_held && state.pan_started_in_canvas {
         // Space: pan by just moving the mouse (no click needed)
         let delta = ui.input(|i| i.pointer.delta());
         state.canvas_offset.0 += delta.x;
         state.canvas_offset.1 += delta.y;
-    } else if middle_mouse_held && response.dragged() {
+    } else if middle_mouse_held && state.pan_started_in_canvas && response.dragged() {
         // Middle mouse: pan while dragging
         let delta = response.drag_delta();
         state.canvas_offset.0 += delta.x;
@@ -2938,6 +2982,49 @@ fn render_canvas(ui: &mut egui::Ui, state: &mut AppState) {
             // Initialize drag accumulator if we selected a part
             if let Some(part) = state.get_selected_placed_part() {
                 state.drag_accumulator = part.position;
+            }
+        }
+    }
+
+    // Handle double-click to navigate to character editor for that part
+    if !is_panning && response.double_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            // Find which part was double-clicked (same logic as single-click)
+            for part_info in placed_parts.iter().rev() {
+                let screen_x = canvas_rect.min.x + part_info.position.0 * effective_zoom;
+                let screen_y = canvas_rect.min.y + part_info.position.1 * effective_zoom;
+                let part_size = if let Some(texture) = state.texture_cache.get(&format!(
+                    "{}/{}/{}/{}", part_info.character_name, part_info.part_name,
+                    part_info.state_name, part_info.rotation
+                )) {
+                    texture.size_vec2() * effective_zoom
+                } else {
+                    egui::vec2(16.0, 16.0) * effective_zoom
+                };
+                let part_rect = egui::Rect::from_min_size(
+                    egui::pos2(screen_x, screen_y),
+                    part_size,
+                );
+
+                if part_rect.contains(pos) {
+                    // Check pixel transparency if we have image data
+                    let pixel_x = ((pos.x - screen_x) / effective_zoom) as u32;
+                    let pixel_y = ((pos.y - screen_y) / effective_zoom) as u32;
+
+                    let is_hit = if let Some(data) = &part_info.image_data {
+                        is_pixel_opaque(data, pixel_x, pixel_y)
+                    } else {
+                        true
+                    };
+
+                    if is_hit {
+                        // Navigate to character editor for this part
+                        state.active_tab = ActiveTab::CharacterEditor(part_info.character_name.clone());
+                        state.editor_selected_part = Some(part_info.part_name.clone());
+                        state.editor_selected_state = Some(part_info.state_name.clone());
+                        break;
+                    }
+                }
             }
         }
     }
@@ -3313,13 +3400,8 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                 ui.label("You have unsaved changes.");
 
                 // Show time since last save
-                if let Some(duration) = state.time_since_save() {
-                    let minutes = duration.as_secs() / 60;
-                    if minutes > 0 {
-                        ui.label(format!("Last saved {} minute{} ago.", minutes, if minutes == 1 { "" } else { "s" }));
-                    } else {
-                        ui.label("Last saved less than a minute ago.");
-                    }
+                if let Some(last_saved) = state.last_saved_time {
+                    ui.label(format!("Last saved {}.", format_relative_time(last_saved)));
                 } else {
                     ui.label("This project has never been saved.");
                 }
@@ -3548,6 +3630,71 @@ fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                         state.show_new_character_dialog = false;
                     }
                 });
+            });
+    }
+
+    // Clone Character dialog
+    if state.show_clone_character_dialog {
+        egui::Window::new("Clone Character")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if let Some(ref source_name) = state.clone_source_character.clone() {
+                    ui.label(format!("Cloning: {}", source_name));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("New name:");
+                        let text_edit = egui::TextEdit::singleline(&mut state.clone_character_name)
+                            .desired_width(200.0);
+                        let response = ui.add(text_edit);
+
+                        // Request focus and select all text on first frame
+                        if response.gained_focus() || !response.has_focus() {
+                            response.request_focus();
+                            if let Some(mut text_state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                                text_state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    egui::text::CCursor::new(state.clone_character_name.len()),
+                                )));
+                                text_state.store(ui.ctx(), response.id);
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let name_empty = state.clone_character_name.is_empty();
+                        let name_exists = state.project.as_ref()
+                            .map(|p| p.get_character(&state.clone_character_name).is_some())
+                            .unwrap_or(false);
+                        let name_valid = !name_empty && !name_exists;
+
+                        if ui.add_enabled(name_valid, egui::Button::new("Clone")).clicked() {
+                            if let Some(ref mut project) = state.project {
+                                if let Some(original) = project.get_character(&source_name) {
+                                    let mut cloned = original.clone();
+                                    cloned.name = state.clone_character_name.clone();
+                                    project.add_character(cloned);
+                                    state.active_character = Some(state.clone_character_name.clone());
+                                    state.current_animation = 0;
+                                    state.current_frame = 0;
+                                    state.set_status(format!("Cloned '{}' as '{}'", source_name, state.clone_character_name));
+                                }
+                            }
+                            state.show_clone_character_dialog = false;
+                            state.clone_source_character = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            state.show_clone_character_dialog = false;
+                            state.clone_source_character = None;
+                        }
+                    });
+                    if state.project.as_ref()
+                        .map(|p| p.get_character(&state.clone_character_name).is_some())
+                        .unwrap_or(false) {
+                        ui.colored_label(egui::Color32::from_rgb(255, 150, 150), "Name already in use");
+                    }
+                }
             });
     }
 
