@@ -8,7 +8,7 @@ use crate::model::{Animation, Character, EditorState, PlacedPart, Project};
 use super::config::AppConfig;
 use super::types::{ActiveTab, ContextMenuTarget, DraggedPart, GalleryDrag, PendingAction, ZOOM_LEVELS};
 
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct AppState {
     pub project: Option<Project>,
     pub project_path: Option<PathBuf>,
@@ -105,6 +105,12 @@ pub struct AppState {
     // Reference view settings (global, not per-frame)
     pub reference_opacity: f32,
     pub reference_show_on_top: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AppState {

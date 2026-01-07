@@ -1760,7 +1760,7 @@ fn render_welcome_screen(ui: &mut egui::Ui, state: &mut AppState) {
         );
         ui.label(
             egui::RichText::new("by Elle Trudgett")
-                .size(scaled_font(14.0, ui_scale))
+                .size(scaled_font(18.0, ui_scale))
                 .color(egui::Color32::GRAY),
         );
         ui.label(format!("v{}", VERSION));
