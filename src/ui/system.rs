@@ -1843,10 +1843,9 @@ fn render_welcome_screen(ui: &mut egui::Ui, state: &mut AppState) {
                     .unwrap_or_default();
                 let display_name = project_name.unwrap_or_else(|| filename.clone());
 
-                let card_response = ui.with_layout(
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        let frame_response = egui::Frame::none()
+                // Double-render approach: measure invisibly first, then center
+                let render_card = |ui: &mut egui::Ui| {
+                    egui::Frame::none()
                         .fill(egui::Color32::from_rgb(45, 45, 55))
                         .rounding(scaled_margin(8.0, ui_scale))
                         .inner_margin(scaled_margin(12.0, ui_scale))
@@ -1881,12 +1880,27 @@ fn render_welcome_screen(ui: &mut egui::Ui, state: &mut AppState) {
                                     }
                                 }
                             });
-                        });
+                        })
+                };
 
-                        frame_response
-                    },
+                // Measure width with invisible render (constrain to minimal width so Frame doesn't expand)
+                let mut hidden = ui.new_child(
+                    egui::UiBuilder::new()
+                        .invisible()
+                        .max_rect(egui::Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(1.0, 10000.0), // minimal width, large height
+                        )),
                 );
+                render_card(&mut hidden);
+                let card_width = hidden.min_rect().width();
 
+                // Center and render visibly (horizontal prevents Frame expansion)
+                let card_response = ui.horizontal(|ui| {
+                    let total_width = ui.max_rect().width();
+                    ui.add_space((total_width - card_width) / 2.0);
+                    render_card(ui)
+                });
                 let card_rect = card_response.inner.response.rect;
 
                 let button_size_small = scaled_margin(24.0, ui_scale);

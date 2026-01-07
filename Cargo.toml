@@ -1,6 +1,6 @@
 [package]
 name = "pixel-sprite-studio"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Pixel Sprite Studio - A sprite animation tool with part-based characters and spritesheet export"
 license = "MIT"

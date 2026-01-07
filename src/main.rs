@@ -6,7 +6,7 @@ mod state;
 mod ui;
 
 use bevy::prelude::*;
-use bevy::window::{PrimaryWindow, WindowCloseRequested};
+use bevy::window::{Monitor, PrimaryWindow, WindowCloseRequested};
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 
 use state::PendingAction;
@@ -25,9 +25,45 @@ fn main() {
         }))
         .add_plugins(EguiPlugin)
         .init_resource::<AppState>()
+        .init_resource::<WindowSizeAdjusted>()
         .add_systems(Startup, (setup, configure_fonts))
-        .add_systems(Update, (ui_system, handle_window_close, update_window_title))
+        .add_systems(Update, (ui_system, handle_window_close, update_window_title, adjust_window_size))
         .run();
+}
+
+/// Tracks whether we've already adjusted window size (runs once)
+#[derive(Resource, Default)]
+struct WindowSizeAdjusted(bool);
+
+/// Adjust window size based on monitor resolution (runs once on first frame)
+fn adjust_window_size(
+    mut adjusted: ResMut<WindowSizeAdjusted>,
+    monitors: Query<&Monitor>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if adjusted.0 {
+        return;
+    }
+    adjusted.0 = true;
+
+    // Find the primary or largest monitor
+    let monitor_size = monitors
+        .iter()
+        .max_by_key(|m| {
+            let size = m.physical_size();
+            size.x * size.y
+        })
+        .map(|m| m.physical_size());
+
+    if let (Some(size), Ok(mut window)) = (monitor_size, windows.get_single_mut()) {
+        // If monitor is at least 125% of 1920x1080 (2400x1350), use larger window
+        let min_width = (1920.0 * 1.25) as u32;
+        let min_height = (1080.0 * 1.25) as u32;
+
+        if size.x >= min_width && size.y >= min_height {
+            window.resolution.set(1920.0, 1080.0);
+        }
+    }
 }
 
 fn setup(mut commands: Commands) {
