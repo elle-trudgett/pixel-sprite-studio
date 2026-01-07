@@ -384,7 +384,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
 
     // Status bar (bottom-most panel, before timeline)
     egui::TopBottomPanel::bottom("status_bar")
-        .max_height(24.0)
+        .exact_height(scaled_margin(24.0, ui_scale))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some((ref msg, ref when)) = state.status_message {
@@ -1843,14 +1843,10 @@ fn render_welcome_screen(ui: &mut egui::Ui, state: &mut AppState) {
                     .unwrap_or_default();
                 let display_name = project_name.unwrap_or_else(|| filename.clone());
 
-                let char_width = scaled_margin(7.0, ui_scale);
-                let min_card_width = scaled_margin(300.0, ui_scale);
-                let estimated_card_width = (path.len() as f32 * char_width).max(min_card_width);
-                let card_response = ui.horizontal(|ui| {
-                    let available = ui.available_width();
-                    ui.add_space(((available - estimated_card_width) / 2.0).max(0.0));
-
-                    let frame_response = egui::Frame::none()
+                let card_response = ui.with_layout(
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        let frame_response = egui::Frame::none()
                         .fill(egui::Color32::from_rgb(45, 45, 55))
                         .rounding(scaled_margin(8.0, ui_scale))
                         .inner_margin(scaled_margin(12.0, ui_scale))
@@ -1887,10 +1883,9 @@ fn render_welcome_screen(ui: &mut egui::Ui, state: &mut AppState) {
                             });
                         });
 
-                    ui.add_space(ui.available_width());
-
-                    frame_response
-                });
+                        frame_response
+                    },
+                );
 
                 let card_rect = card_response.inner.response.rect;
 
