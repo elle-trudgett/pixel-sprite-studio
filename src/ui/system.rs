@@ -52,27 +52,29 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
 
     // Global keyboard shortcuts for UI scale (Ctrl+Plus/Minus/0)
     // Plus requires Shift on most keyboards (Shift+=), Minus and 0 do not
-    if ctx.input(|i| {
+    // Consume the key events to prevent UI jumbling even at min/max
+    let increase_pressed = ctx.input_mut(|i| {
         i.modifiers.command
-            && (i.key_pressed(egui::Key::Plus)
-                || (i.modifiers.shift && i.key_pressed(egui::Key::Equals)))
-    }) {
-        if state.config.ui_scale < 2.0 {
-            state.config.ui_scale = (state.config.ui_scale + 0.25).min(2.0);
-            state.config.save();
-        }
+            && (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Equals))
+    });
+    if increase_pressed && state.config.ui_scale < 2.0 {
+        state.config.ui_scale = (state.config.ui_scale + 0.25).min(2.0);
+        state.config.save();
     }
-    if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Minus)) {
-        if state.config.ui_scale > 0.75 {
-            state.config.ui_scale = (state.config.ui_scale - 0.25).max(0.75);
-            state.config.save();
-        }
+    let decrease_pressed = ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus)
+    });
+    if decrease_pressed && state.config.ui_scale > 0.75 {
+        state.config.ui_scale = (state.config.ui_scale - 0.25).max(0.75);
+        state.config.save();
     }
-    if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Num0)) {
-        if state.config.ui_scale != 1.0 {
-            state.config.ui_scale = 1.0;
-            state.config.save();
-        }
+    let reset_pressed = ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0)
+    });
+    if reset_pressed && state.config.ui_scale != 1.0 {
+        state.config.ui_scale = 1.0;
+        state.config.save();
     }
 
     // Handle animation playback
