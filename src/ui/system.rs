@@ -50,23 +50,25 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
     style.wrap_mode = Some(egui::TextWrapMode::Extend);
     ctx.set_style(style);
 
-    // Global keyboard shortcuts for UI scale (Ctrl+Shift+Plus/Minus/0)
-    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Plus))
-        || ctx
-            .input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Equals))
-    {
+    // Global keyboard shortcuts for UI scale (Ctrl+Plus/Minus/0)
+    // Plus requires Shift on most keyboards (Shift+=), Minus and 0 do not
+    if ctx.input(|i| {
+        i.modifiers.command
+            && (i.key_pressed(egui::Key::Plus)
+                || (i.modifiers.shift && i.key_pressed(egui::Key::Equals)))
+    }) {
         if state.config.ui_scale < 2.0 {
             state.config.ui_scale = (state.config.ui_scale + 0.25).min(2.0);
             state.config.save();
         }
     }
-    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Minus)) {
+    if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Minus)) {
         if state.config.ui_scale > 0.75 {
             state.config.ui_scale = (state.config.ui_scale - 0.25).max(0.75);
             state.config.save();
         }
     }
-    if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::Num0)) {
+    if ctx.input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Num0)) {
         if state.config.ui_scale != 1.0 {
             state.config.ui_scale = 1.0;
             state.config.save();
@@ -200,7 +202,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                         let button_size = scaled_margin(20.0, state.config.ui_scale);
                         if ui
                             .add_sized([button_size, button_size], egui::Button::new("−"))
-                            .on_hover_text("Decrease UI scale (Ctrl+Shift+−)")
+                            .on_hover_text("Decrease UI scale (Ctrl+−)")
                             .clicked()
                             && state.config.ui_scale > 0.75
                         {
@@ -211,7 +213,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                         ui.label(format!("{:.0}%", state.config.ui_scale * 100.0));
                         if ui
                             .add_sized([button_size, button_size], egui::Button::new("+"))
-                            .on_hover_text("Increase UI scale (Ctrl+Shift++)")
+                            .on_hover_text("Increase UI scale (Ctrl++)")
                             .clicked()
                             && state.config.ui_scale < 2.0
                         {
@@ -222,7 +224,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                         if state.config.ui_scale != 1.0 {
                             if ui
                                 .small_button("Reset")
-                                .on_hover_text("Reset to 100% (Ctrl+Shift+0)")
+                                .on_hover_text("Reset to 100% (Ctrl+0)")
                                 .clicked()
                             {
                                 state.config.ui_scale = 1.0;
