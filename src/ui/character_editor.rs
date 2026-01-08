@@ -138,6 +138,7 @@ pub fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_nam
                             });
                             state.rename_new_name = part_name.clone();
                             state.show_rename_dialog = true;
+                            state.dialog_needs_focus = true;
                             ui.close_menu();
                         }
                         if ui.button("Delete").clicked() {
@@ -155,6 +156,7 @@ pub fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_nam
                 if ui.button("+ Add Part").clicked() {
                     state.show_new_part_dialog = true;
                     state.new_part_name.clear();
+                    state.dialog_needs_focus = true;
                 }
             },
         );
@@ -193,6 +195,7 @@ pub fn render_character_editor(ui: &mut egui::Ui, state: &mut AppState, char_nam
                     if ui.button("+ Add State").clicked() {
                         state.show_new_state_dialog = true;
                         state.new_state_name.clear();
+                        state.dialog_needs_focus = true;
                     }
                 } else {
                     ui.label("Select a part");

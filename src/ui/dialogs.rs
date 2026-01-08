@@ -25,7 +25,11 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("New name:");
-                    ui.text_edit_singleline(&mut state.rename_new_name);
+                    let response = ui.text_edit_singleline(&mut state.rename_new_name);
+                    if state.dialog_needs_focus {
+                        response.request_focus();
+                        state.dialog_needs_focus = false;
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Rename").clicked() && !state.rename_new_name.is_empty() {
@@ -444,7 +448,11 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Name:");
-                    ui.text_edit_singleline(&mut state.new_animation_name);
+                    let response = ui.text_edit_singleline(&mut state.new_animation_name);
+                    if state.dialog_needs_focus {
+                        response.request_focus();
+                        state.dialog_needs_focus = false;
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() && !state.new_animation_name.is_empty() {
@@ -489,7 +497,11 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                 ui.separator();
 
                 ui.label("Enter path to PNG image:");
-                ui.text_edit_singleline(&mut state.import_image_path);
+                let response = ui.text_edit_singleline(&mut state.import_image_path);
+                if state.dialog_needs_focus {
+                    response.request_focus();
+                    state.dialog_needs_focus = false;
+                }
 
                 ui.horizontal(|ui| {
                     if ui.button("Import").clicked() && !state.import_image_path.is_empty() {
@@ -562,7 +574,11 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Name:");
-                    ui.text_edit_singleline(&mut state.new_character_name);
+                    let response = ui.text_edit_singleline(&mut state.new_character_name);
+                    if state.dialog_needs_focus {
+                        response.request_focus();
+                        state.dialog_needs_focus = false;
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() && !state.new_character_name.is_empty() {
@@ -607,8 +623,10 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                         let response = ui.add(text_edit);
 
                         // Request focus and select all text on first frame
-                        if response.gained_focus() || !response.has_focus() {
+                        if state.dialog_needs_focus {
                             response.request_focus();
+                            state.dialog_needs_focus = false;
+                            // Select all text
                             if let Some(mut text_state) =
                                 egui::TextEdit::load_state(ui.ctx(), response.id)
                             {
@@ -687,7 +705,11 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Name:");
-                    ui.text_edit_singleline(&mut state.new_part_name);
+                    let response = ui.text_edit_singleline(&mut state.new_part_name);
+                    if state.dialog_needs_focus {
+                        response.request_focus();
+                        state.dialog_needs_focus = false;
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() && !state.new_part_name.is_empty() {
@@ -725,7 +747,11 @@ pub fn render_dialogs(ctx: &egui::Context, state: &mut AppState) {
                 }
                 ui.horizontal(|ui| {
                     ui.label("Name:");
-                    ui.text_edit_singleline(&mut state.new_state_name);
+                    let response = ui.text_edit_singleline(&mut state.new_state_name);
+                    if state.dialog_needs_focus {
+                        response.request_focus();
+                        state.dialog_needs_focus = false;
+                    }
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Create").clicked() && !state.new_state_name.is_empty() {

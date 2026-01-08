@@ -66,6 +66,7 @@ pub struct AppState {
     pub show_rename_dialog: bool,
     pub show_delete_confirm_dialog: bool,
     pub show_clone_character_dialog: bool,
+    pub dialog_needs_focus: bool, // Set true when opening a dialog to auto-focus text input
 
     // Rename/delete context
     pub context_menu_target: Option<ContextMenuTarget>,
@@ -159,6 +160,7 @@ impl AppState {
             show_rename_dialog: false,
             show_delete_confirm_dialog: false,
             show_clone_character_dialog: false,
+            dialog_needs_focus: false,
             context_menu_target: None,
             rename_new_name: String::new(),
             clone_source_character: None,

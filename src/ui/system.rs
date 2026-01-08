@@ -256,6 +256,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                     {
                         state.show_new_character_dialog = true;
                         state.new_character_name.clear();
+                        state.dialog_needs_focus = true;
                         ui.close_menu();
                     }
 
@@ -271,6 +272,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                     {
                         state.show_new_part_dialog = true;
                         state.new_part_name.clear();
+                        state.dialog_needs_focus = true;
                         ui.close_menu();
                     }
                     if ui
@@ -279,6 +281,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                     {
                         state.show_new_state_dialog = true;
                         state.new_state_name.clear();
+                        state.dialog_needs_focus = true;
                         ui.close_menu();
                     }
                 },
@@ -293,6 +296,7 @@ pub fn ui_system(mut contexts: EguiContexts, mut state: ResMut<AppState>, time: 
                     {
                         state.show_new_animation_dialog = true;
                         state.new_animation_name.clear();
+                        state.dialog_needs_focus = true;
                         ui.close_menu();
                     }
                     ui.separator();
@@ -504,6 +508,7 @@ fn render_asset_browser(ui: &mut egui::Ui, state: &mut AppState) {
                         if ui.selectable_label(false, "+ New Character...").clicked() {
                             state.show_new_character_dialog = true;
                             state.new_character_name.clear();
+                            state.dialog_needs_focus = true;
                         }
                     });
 
@@ -519,11 +524,13 @@ fn render_asset_browser(ui: &mut egui::Ui, state: &mut AppState) {
                             });
                             state.rename_new_name = active_char.clone();
                             state.show_rename_dialog = true;
+                            state.dialog_needs_focus = true;
                         }
                         if ui.small_button("Clone").clicked() {
                             state.clone_source_character = Some(active_char.clone());
                             state.clone_character_name = format!("{} (copy)", active_char);
                             state.show_clone_character_dialog = true;
+                            state.dialog_needs_focus = true;
                         }
                         if ui.small_button("Delete").clicked() {
                             state.context_menu_target = Some(ContextMenuTarget::Character {
@@ -562,6 +569,7 @@ fn render_asset_browser(ui: &mut egui::Ui, state: &mut AppState) {
                             {
                                 state.show_new_animation_dialog = true;
                                 state.new_animation_name.clear();
+                                state.dialog_needs_focus = true;
                             }
                         });
                     });
@@ -602,6 +610,7 @@ fn render_asset_browser(ui: &mut egui::Ui, state: &mut AppState) {
                                                 });
                                             state.rename_new_name = anim_name.clone();
                                             state.show_rename_dialog = true;
+                                            state.dialog_needs_focus = true;
                                             ui.close_menu();
                                         }
                                         if ui.button("Delete").clicked() {
