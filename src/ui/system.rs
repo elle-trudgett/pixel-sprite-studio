@@ -3,9 +3,9 @@ use bevy_egui::{egui, EguiContexts};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::export::{export_all_animations, export_current_animation};
+use crate::export::{export_all_animations, export_current_animation, render_frame_to_image};
 use crate::file::{pick_export_file, pick_export_folder, pick_open_file, pick_save_file};
-use crate::imaging::{create_reference_thumbnail, decode_base64_to_texture, calculate_fit_scale};
+use crate::imaging::{create_reference_thumbnail, decode_base64_to_texture, calculate_fit_scale, render_frame_thumbnail};
 use crate::model::Project;
 use crate::state::{ActiveTab, ContextMenuTarget, GalleryDrag, PendingAction, DEFAULT_PANEL_MARGIN, ZOOM_LEVELS};
 use crate::state::AppState;
@@ -497,6 +497,7 @@ fn render_asset_browser(ui: &mut egui::Ui, state: &mut AppState) {
                                 state.current_animation = 0;
                                 state.current_frame = 0;
                                 state.needs_zoom_fit = true;
+                                state.frame_thumbnail_cache.clear();
                             }
                         }
                         ui.separator();
@@ -1573,26 +1574,148 @@ fn render_timeline(ctx: &egui::Context, state: &mut AppState) {
                     });
                 });
 
+            // Calculate thumbnail dimensions
+            let available_height = ui.available_height();
+            let thumb_height = (available_height - scaled_margin(8.0, state.config.ui_scale)).max(32.0);
+            let thumb_height_u32 = thumb_height as u32;
+
+            // Get canvas size for aspect ratio
+            let canvas_size = state
+                .active_character_ref()
+                .map(|c| c.canvas_size)
+                .unwrap_or((64, 64));
+            let aspect_ratio = canvas_size.0 as f32 / canvas_size.1 as f32;
+            let thumb_width = thumb_height * aspect_ratio;
+
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let char_name = state.active_character.clone();
                     let anim_idx = state.current_animation;
-                    for frame in 0..total_frames {
+
+                    // Collect frame data needed for thumbnail generation
+                    let frame_data: Vec<_> = if let Some(anim) = state.current_animation() {
+                        (0..total_frames)
+                            .map(|frame_idx| {
+                                let content_hash = anim
+                                    .frames
+                                    .get(frame_idx)
+                                    .map(|f| f.content_hash())
+                                    .unwrap_or(0);
+                                (frame_idx, content_hash)
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    for (frame, content_hash) in frame_data {
                         let is_current = frame == state.current_frame;
-                        let text = format!("{}", frame + 1);
+                        let cache_key = format!(
+                            "thumb/{}/{}/{}",
+                            char_name.as_deref().unwrap_or(""),
+                            anim_idx,
+                            frame
+                        );
 
-                        let button = if is_current {
-                            egui::Button::new(egui::RichText::new(text).strong())
-                                .fill(egui::Color32::from_rgb(80, 120, 180))
+                        // Check if thumbnail needs regeneration
+                        let needs_regen = state
+                            .frame_thumbnail_cache
+                            .get(&cache_key)
+                            .map(|(_, hash)| *hash != content_hash)
+                            .unwrap_or(true);
+
+                        // Generate thumbnail if needed
+                        if needs_regen {
+                            if let (Some(project), Some(anim)) =
+                                (&state.project, state.current_animation())
+                            {
+                                if let Ok(frame_image) =
+                                    render_frame_to_image(project, anim, frame, canvas_size)
+                                {
+                                    let texture = render_frame_thumbnail(
+                                        ctx,
+                                        &frame_image,
+                                        thumb_height_u32,
+                                        &cache_key,
+                                    );
+                                    state
+                                        .frame_thumbnail_cache
+                                        .insert(cache_key.clone(), (texture, content_hash));
+                                }
+                            }
+                        }
+
+                        // Allocate space for the thumbnail
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(thumb_width, thumb_height),
+                            egui::Sense::click(),
+                        );
+
+                        // Draw background
+                        let bg_color = if is_current {
+                            egui::Color32::from_rgb(80, 120, 180)
+                        } else if response.hovered() {
+                            egui::Color32::from_rgb(60, 60, 70)
                         } else {
-                            egui::Button::new(text)
+                            egui::Color32::from_rgb(40, 40, 50)
                         };
+                        ui.painter().rect_filled(rect, 2.0, bg_color);
 
-                        let response = ui.add_sized([40.0, 60.0], button);
+                        // Draw thumbnail if cached
+                        if let Some((texture, _)) = state.frame_thumbnail_cache.get(&cache_key) {
+                            let padding = 2.0;
+                            let inner_rect = rect.shrink(padding);
+                            ui.painter().image(
+                                texture.id(),
+                                inner_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
+
+                        // Draw frame number label in corner
+                        let label_text = format!("{}", frame + 1);
+                        let font_size = scaled_font(10.0, state.config.ui_scale);
+                        let font = egui::FontId::proportional(font_size);
+                        let label_pos = egui::pos2(rect.min.x + 3.0, rect.min.y + 1.0);
+
+                        // Draw label background for readability
+                        let galley = ui.painter().layout_no_wrap(
+                            label_text.clone(),
+                            font.clone(),
+                            egui::Color32::WHITE,
+                        );
+                        let label_rect = egui::Rect::from_min_size(
+                            label_pos,
+                            galley.size() + egui::vec2(4.0, 2.0),
+                        );
+                        ui.painter().rect_filled(
+                            label_rect,
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                        );
+                        ui.painter()
+                            .text(label_pos + egui::vec2(2.0, 1.0), egui::Align2::LEFT_TOP, label_text, font, egui::Color32::WHITE);
+
+                        // Draw selection border for current frame
+                        if is_current {
+                            ui.painter().rect_stroke(
+                                rect,
+                                2.0,
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(100, 160, 255)),
+                            );
+                        }
+
+                        // Handle click
                         if response.clicked() {
                             state.current_frame = frame;
                             state.selected_part_id = None;
                         }
+
+                        // Context menu for delete
                         if let Some(ref cn) = char_name {
                             let cn = cn.clone();
                             response.context_menu(|ui| {
@@ -1608,6 +1731,8 @@ fn render_timeline(ctx: &egui::Context, state: &mut AppState) {
                             });
                         }
                     }
+
+                    // Add frame buttons
                     let mut add_blank = false;
                     let mut add_copy = false;
                     ui.vertical(|ui| {

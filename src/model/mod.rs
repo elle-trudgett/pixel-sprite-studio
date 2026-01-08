@@ -280,6 +280,24 @@ impl Frame {
             reference: None,
         }
     }
+
+    /// Generate a hash of the frame's visual content for cache invalidation
+    pub fn content_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.placed_parts.len().hash(&mut hasher);
+        for part in &self.placed_parts {
+            part.part_name.hash(&mut hasher);
+            part.state_name.hash(&mut hasher);
+            part.rotation.hash(&mut hasher);
+            ((part.position.0 * 100.0) as i32).hash(&mut hasher);
+            ((part.position.1 * 100.0) as i32).hash(&mut hasher);
+            part.visible.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
 }
 
 /// An animation is a sequence of frames

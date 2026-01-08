@@ -95,6 +95,9 @@ pub struct AppState {
     // Loaded textures cache (texture_id -> egui::TextureHandle)
     pub texture_cache: HashMap<String, egui::TextureHandle>,
 
+    // Frame thumbnail cache for timeline (key -> (texture, content_hash))
+    pub frame_thumbnail_cache: HashMap<String, (egui::TextureHandle, u64)>,
+
     // Reference image state
     pub dragging_reference: bool,
     pub reference_drag_start: (f32, f32),
@@ -172,6 +175,7 @@ impl AppState {
             import_image_path: String::new(),
             status_message: None,
             texture_cache: HashMap::new(),
+            frame_thumbnail_cache: HashMap::new(),
             dragging_reference: false,
             reference_drag_start: (0.0, 0.0),
             reference_initial_pos: (0.0, 0.0),
@@ -386,6 +390,7 @@ impl AppState {
         self.active_character = None;
         self.active_tab = ActiveTab::Canvas;
         self.texture_cache.clear();
+        self.frame_thumbnail_cache.clear();
     }
 
     pub fn has_unsaved_changes(&self) -> bool {

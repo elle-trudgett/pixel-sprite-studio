@@ -199,3 +199,34 @@ pub fn load_reference_texture(
         file_path
     ))
 }
+
+/// Render a frame image to a thumbnail texture for the timeline
+pub fn render_frame_thumbnail(
+    ctx: &egui::Context,
+    frame_image: &image::RgbaImage,
+    thumbnail_height: u32,
+    cache_key: &str,
+) -> egui::TextureHandle {
+    let canvas_w = frame_image.width();
+    let canvas_h = frame_image.height();
+
+    // Calculate thumbnail width maintaining aspect ratio
+    let aspect_ratio = canvas_w as f32 / canvas_h as f32;
+    let thumb_width = (thumbnail_height as f32 * aspect_ratio).round() as u32;
+    let thumb_height = thumbnail_height;
+
+    // Resize using nearest neighbor to preserve pixel art crispness
+    let resized = image::imageops::resize(
+        frame_image,
+        thumb_width,
+        thumb_height,
+        image::imageops::FilterType::Nearest,
+    );
+
+    // Convert to egui texture
+    let size = [resized.width() as usize, resized.height() as usize];
+    let pixels = resized.into_raw();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+
+    ctx.load_texture(cache_key, color_image, egui::TextureOptions::NEAREST)
+}
